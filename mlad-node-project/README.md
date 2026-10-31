@@ -68,3 +68,11 @@ The Node server speaks HTTP and must not be exposed directly to the internet in 
 For production, set `NODE_ENV=production`, `HOST=127.0.0.1`, `PORT=3000`, `APP_BASE_URL=https://your-domain.example`, `TRUST_PROXY=true`, and valid `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, and `MAIL_FROM` values in `.env`. The app refuses to start in production without an HTTPS base URL, trusted-proxy mode, and SMTP configuration. Only enable `TRUST_PROXY` when direct access to the Node port is blocked and the proxy overwrites forwarded headers.
 
 Start the app under a process manager, then run Caddy with `DOMAIN=your-domain.example caddy run --config Caddyfile`. Promote the initial admin after registering its account with `npm run promote-admin -- admin@your-domain.example`. Verify the deployment with `curl -I https://your-domain.example` and confirm plain HTTP redirects to HTTPS. Public deployment still requires a real domain, DNS, a host, and SMTP credentials.
+
+## Render Deployment
+
+The repository includes a Render Blueprint at its root. Connect the repository to Render and create a Blueprint; it builds and runs the app from `mlad-node-project/`. The Blueprint uses Render's free instance tier for initial validation, which may spin down while idle. Select a paid instance in Render if the app needs consistent availability.
+
+Set the prompted `APP_BASE_URL` to the HTTPS URL assigned by Render. Enter the Supabase session-pooler `DATABASE_URL` and SMTP values as private environment values. Upload the Supabase database root certificate as a Render secret file named `supabase-ca.crt`; the Blueprint points `DATABASE_SSL_CA` at `/etc/secrets/supabase-ca.crt`. Do not commit the certificate or credentials. Render supplies HTTPS and the listening port; the service binds to `0.0.0.0` and trusts Render's reverse proxy.
+
+After the first successful deploy, register the intended administrator and run `npm run promote-admin -- admin@your-domain.example` from the Render Shell or a trusted local environment configured for the same Supabase database. Verify registration, verification email delivery, and sign-in before sharing the URL publicly.

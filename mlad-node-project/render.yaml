@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: account-desk
+    runtime: node
+    plan: free
+    rootDir: mlad-node-project
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: APP_BASE_URL
+        sync: false
+      - key: DB_BACKEND
+        value: postgres
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL_CA
+        value: /etc/secrets/supabase-ca.crt
+      - key: TRUST_PROXY
+        value: "true"
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_SECURE
+        value: "false"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: MAIL_FROM
+        sync: false

@@ -11,10 +11,12 @@
     "promote-admin": "node server.js promote-admin",
     "db:backup": "node db-tools.js backup",
     "db:restore": "node db-tools.js restore",
+    "db:migrate-supabase": "node db-tools.js migrate-supabase",
     "test": "node --test account-roles.test.js"
   },
   "dependencies": {
     "dotenv": "^18.0.9",
-    "nodemailer": "^10.3.0"
+    "nodemailer": "^10.3.0",
+    "pg": "^8.23.1"
   }
 }

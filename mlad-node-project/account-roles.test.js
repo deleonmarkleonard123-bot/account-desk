@@ -94,7 +94,7 @@ function latestEmailToken(purpose, email) {
 function runPromotion(email) {
 	return spawnSync(process.execPath, [serverFile, 'promote-admin', email], {
 		encoding: 'utf8',
-		env: { ...process.env, DB_PATH: databaseFile }
+		env: { ...process.env, DB_BACKEND: 'sqlite', DB_PATH: databaseFile }
 	});
 }
 
@@ -107,7 +107,8 @@ async function startAppServer() {
 			PORT: String(appPort),
 			APP_BASE_URL: 'https://accounts.example.test',
 			DB_PATH: databaseFile,
-			NODE_ENV: 'production',
+			DB_BACKEND: 'sqlite',
+			NODE_ENV: 'test',
 			SMTP_HOST: '127.0.0.1',
 			SMTP_PORT: String(smtpPort),
 			MAIL_FROM: 'Account Desk <no-reply@example.test>',
@@ -659,6 +660,7 @@ test('registration, sign-in, and password-reset requests are rate limited', asyn
 			...process.env,
 			HOST: '127.0.0.1',
 			PORT: String(ratePort),
+			DB_BACKEND: 'sqlite',
 			DB_PATH: rateDatabase,
 			NODE_ENV: 'test',
 			SMTP_HOST: '',
@@ -790,7 +792,7 @@ test('registration, sign-in, and password-reset requests are rate limited', asyn
 test('SQLite backup restores to a new verified database without overwriting files', () => {
 	const backupFile = path.join(temporaryDirectory, 'release-backup.sqlite');
 	const restoredFile = path.join(temporaryDirectory, 'release-restored.sqlite');
-	const env = { ...process.env, DB_PATH: databaseFile };
+	const env = { ...process.env, DB_BACKEND: 'sqlite', DB_PATH: databaseFile };
 	const backupResult = spawnSync(process.execPath, [path.join(__dirname, 'db-tools.js'), 'backup', backupFile], {
 		encoding: 'utf8',
 		env
@@ -835,4 +837,56 @@ test('production startup rejects insecure or incomplete deployment settings', ()
 	});
 	assert.notEqual(result.status, 0);
 	assert.match(`${result.stdout}${result.stderr}`, /APP_BASE_URL to use HTTPS/);
+
+	const missingDatabase = spawnSync(process.execPath, [serverFile], {
+		encoding: 'utf8',
+		env: {
+			...process.env,
+			NODE_ENV: 'production',
+			APP_BASE_URL: 'https://accounts.example.test',
+			TRUST_PROXY: 'true',
+			SMTP_HOST: 'smtp.example.test',
+			MAIL_FROM: 'Account Desk <no-reply@example.test>',
+			DB_BACKEND: 'postgres',
+			DATABASE_URL: '',
+			DB_PATH: path.join(temporaryDirectory, 'missing-production.sqlite')
+		}
+	});
+	assert.notEqual(missingDatabase.status, 0);
+	assert.match(`${missingDatabase.stdout}${missingDatabase.stderr}`, /DATABASE_URL for Supabase Postgres/);
+
+	const missingCertificate = spawnSync(process.execPath, [serverFile], {
+		encoding: 'utf8',
+		env: {
+			...process.env,
+			NODE_ENV: 'production',
+			APP_BASE_URL: 'https://accounts.example.test',
+			TRUST_PROXY: 'true',
+			SMTP_HOST: 'smtp.example.test',
+			MAIL_FROM: 'Account Desk <no-reply@example.test>',
+			DB_BACKEND: 'postgres',
+			DATABASE_URL: 'postgresql://postgres:placeholder@pooler.example.test:5432/postgres',
+			DATABASE_SSL_CA: '',
+			DB_PATH: path.join(temporaryDirectory, 'missing-ca-production.sqlite')
+		}
+	});
+	assert.notEqual(missingCertificate.status, 0);
+	assert.match(`${missingCertificate.stdout}${missingCertificate.stderr}`, /DATABASE_SSL_CA to verify/);
+});
+
+test('Supabase tooling requires a private connection URL and refuses SQLite backup mode', () => {
+	const toolsFile = path.join(__dirname, 'db-tools.js');
+	const missingUrl = spawnSync(process.execPath, [toolsFile, 'migrate-supabase'], {
+		encoding: 'utf8',
+		env: { ...process.env, DB_BACKEND: 'postgres', DATABASE_URL: '' }
+	});
+	assert.notEqual(missingUrl.status, 0);
+	assert.match(`${missingUrl.stdout}${missingUrl.stderr}`, /Set DATABASE_URL in \.env/);
+
+	const wrongBackupMode = spawnSync(process.execPath, [toolsFile, 'backup', path.join(temporaryDirectory, 'should-not-be-created.sqlite')], {
+		encoding: 'utf8',
+		env: { ...process.env, DB_BACKEND: 'postgres', DATABASE_URL: 'postgresql://not-used' }
+	});
+	assert.notEqual(wrongBackupMode.status, 0);
+	assert.match(`${wrongBackupMode.stdout}${wrongBackupMode.stderr}`, /manage SQLite only/);
 });

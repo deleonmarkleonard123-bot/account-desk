@@ -1,6 +1,8 @@
 const http = require('node:http');
 const { createHash, randomBytes, scrypt: scryptCallback, timingSafeEqual } = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { DatabaseSync } = require('node:sqlite');
+const { Pool } = require('pg');
 const { promisify } = require('node:util');
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -19,9 +21,180 @@ const verificationLifetime = 24 * 60 * 60 * 1000;
 const resetLifetime = 15 * 60 * 1000;
 const rateLimitWindowMs = positiveIntegerSetting('RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000);
 let database;
+let postgresPool;
 let queries;
 let mailTransport;
 let dummyPasswordCredentials;
+const transactionStorage = new AsyncLocalStorage();
+
+function normalizeDatabaseRow(row) {
+	if (!row) return row;
+	for (const key of ['count', 'event_id', 'created_at', 'expires_at', 'attempts', 'window_started_at']) {
+		const value = row[key];
+		if (typeof value === 'string' && /^-?\d+$/.test(value)) row[key] = Number(value);
+	}
+	return row;
+}
+
+function postgresPlaceholders(sql) {
+	let index = 0;
+	return sql.replace(/\?/g, () => `$${++index}`);
+}
+
+function normalizedPostgresConnectionString() {
+	const connectionString = new URL(process.env.DATABASE_URL);
+	for (const option of ['sslmode', 'sslcert', 'sslkey', 'sslrootcert']) connectionString.searchParams.delete(option);
+	return connectionString.toString();
+}
+
+async function postgresSslConfig() {
+	const ssl = { rejectUnauthorized: true };
+	if (process.env.DATABASE_SSL_CA) {
+		ssl.ca = await fs.readFile(path.resolve(root, process.env.DATABASE_SSL_CA), 'utf8');
+	}
+	return ssl;
+}
+
+async function executeQuery(sql, execution = { mode: 'run', values: [] }) {
+	const params = execution.values || execution;
+	if (postgresPool) {
+		const client = transactionStorage.getStore() || postgresPool;
+		const result = await client.query(postgresPlaceholders(sql), params);
+		return { rows: result.rows.map(normalizeDatabaseRow), rowCount: result.rowCount };
+	}
+	const statement = database.prepare(sql);
+	if (execution.mode === 'all') return { rows: statement.all(...params), rowCount: 0 };
+	if (execution.mode === 'get') {
+		const row = statement.get(...params);
+		return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+	}
+	const result = statement.run(...params);
+	return { rows: [], rowCount: Number(result.changes) };
+}
+
+function prepareQuery(sql) {
+	return {
+		get: async (...params) => (await executeQuery(sql, { mode: 'get', values: params })).rows[0],
+		all: async (...params) => (await executeQuery(sql, { mode: 'all', values: params })).rows,
+		run: async (...params) => executeQuery(sql, { mode: 'run', values: params })
+	};
+}
+
+async function executeScript(sql) {
+	if (postgresPool) return postgresPool.query(sql);
+	return database.exec(sql);
+}
+
+function buildQueries() {
+	const contains = column => postgresPool
+		? `POSITION(LOWER(?) IN LOWER(${column})) > 0`
+		: `instr(lower(${column}), lower(?)) > 0`;
+	const auditSearch = `(? = '' OR ${contains('action')}
+		OR ${contains('actor_email')}
+		OR ${contains('affected_email')}
+		OR ${contains("COALESCE(actor_account_id, '')")}
+		OR ${contains("COALESCE(affected_account_id, '')")})`;
+	const accountSearch = `(? = '' OR ${contains('display_name')} OR ${contains('email')})`;
+
+	return {
+		findById: prepareQuery('SELECT * FROM accounts WHERE id = ?'),
+		findByEmail: prepareQuery('SELECT * FROM accounts WHERE lower(email) = lower(?)'),
+		insert: prepareQuery(`
+			INSERT INTO accounts (id, email, display_name, created_at, role, status, salt, password_hash)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`),
+		update: prepareQuery('UPDATE accounts SET display_name = ? WHERE id = ?'),
+		updatePendingEmail: prepareQuery('UPDATE accounts SET pending_email = ? WHERE id = ?'),
+		verifyEmail: prepareQuery('UPDATE accounts SET email = ?, pending_email = NULL, email_verified_at = ? WHERE id = ?'),
+		updatePassword: prepareQuery('UPDATE accounts SET salt = ?, password_hash = ? WHERE id = ?'),
+		updateRole: prepareQuery('UPDATE accounts SET role = ? WHERE id = ?'),
+		updateStatus: prepareQuery('UPDATE accounts SET status = ? WHERE id = ?'),
+		delete: prepareQuery('DELETE FROM accounts WHERE id = ?'),
+		count: prepareQuery('SELECT COUNT(*) AS count FROM accounts'),
+		adminCount: prepareQuery("SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin'"),
+		activeAdminCount: prepareQuery("SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin' AND status = 'active'"),
+		findEmailOwner: prepareQuery('SELECT id FROM accounts WHERE (lower(email) = lower(?) OR lower(pending_email) = lower(?)) AND id <> ?'),
+		insertSession: prepareQuery(`
+			INSERT INTO sessions (session_id, token_hash, account_id, created_at, expires_at, user_agent)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`),
+		findSessionByToken: prepareQuery('SELECT * FROM sessions WHERE token_hash = ?'),
+		deleteSessionByToken: prepareQuery('DELETE FROM sessions WHERE token_hash = ?'),
+		listSessions: prepareQuery('SELECT * FROM sessions WHERE account_id = ? AND expires_at > ? ORDER BY created_at DESC'),
+		findSessionById: prepareQuery('SELECT * FROM sessions WHERE session_id = ? AND account_id = ? AND expires_at > ?'),
+		deleteSessionById: prepareQuery('DELETE FROM sessions WHERE session_id = ? AND account_id = ?'),
+		deleteAccountSessions: prepareQuery('DELETE FROM sessions WHERE account_id = ?'),
+		deleteExpiredSessions: prepareQuery('DELETE FROM sessions WHERE expires_at <= ?'),
+		findRateLimit: prepareQuery('SELECT * FROM rate_limits WHERE bucket_hash = ?'),
+		resetRateLimit: prepareQuery(`
+			INSERT INTO rate_limits (bucket_hash, window_started_at, attempts, expires_at)
+			VALUES (?, ?, 1, ?)
+			ON CONFLICT(bucket_hash) DO UPDATE SET
+				window_started_at = excluded.window_started_at,
+				attempts = 1,
+				expires_at = excluded.expires_at
+		`),
+		incrementRateLimit: prepareQuery('UPDATE rate_limits SET attempts = attempts + 1 WHERE bucket_hash = ?'),
+		deleteExpiredRateLimits: prepareQuery('DELETE FROM rate_limits WHERE expires_at <= ?'),
+		insertAuditEvent: prepareQuery(`
+			INSERT INTO audit_events (
+				actor_account_id, actor_email, action, affected_account_id,
+				affected_email, occurred_at, metadata_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?)
+		`),
+		countAuditEvents: prepareQuery(`SELECT COUNT(*) AS count FROM audit_events WHERE ${auditSearch}`),
+		listAuditEvents: prepareQuery(`
+			SELECT * FROM audit_events WHERE ${auditSearch}
+			ORDER BY occurred_at DESC, event_id DESC LIMIT ? OFFSET ?
+		`),
+		findToken: prepareQuery('SELECT * FROM account_tokens WHERE token_hash = ?'),
+		insertAccountToken: prepareQuery(`
+			INSERT INTO account_tokens (token_hash, account_id, purpose, email, expires_at, used_at)
+			VALUES (?, ?, ?, ?, ?, NULL)
+		`),
+		deleteAccountTokensByPurpose: prepareQuery('DELETE FROM account_tokens WHERE account_id = ? AND purpose = ? AND used_at IS NULL'),
+		markTokenUsed: prepareQuery('UPDATE account_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL'),
+		invalidateAccountTokens: prepareQuery('DELETE FROM account_tokens WHERE account_id = ? AND used_at IS NULL'),
+		countAccounts: prepareQuery(`
+			SELECT COUNT(*) AS count FROM accounts
+			WHERE ${accountSearch} AND (? = 'all' OR status = ?)
+		`),
+		listAccounts: prepareQuery(`
+			SELECT * FROM accounts
+			WHERE ${accountSearch} AND (? = 'all' OR status = ?)
+			ORDER BY created_at DESC, id LIMIT ? OFFSET ?
+		`)
+	};
+}
+
+async function withTransaction(callback) {
+	if (postgresPool) {
+		const client = await postgresPool.connect();
+		try {
+			await client.query('BEGIN');
+			return await transactionStorage.run(client, async () => {
+				const result = await callback();
+				await client.query('COMMIT');
+				return result;
+			});
+		} catch (error) {
+			await client.query('ROLLBACK');
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	database.exec('BEGIN IMMEDIATE');
+	try {
+		const result = await callback();
+		database.exec('COMMIT');
+		return result;
+	} catch (error) {
+		database.exec('ROLLBACK');
+		throw error;
+	}
+}
 
 function sendJson(response, status, value, headers = {}) {
 	response.writeHead(status, {
@@ -39,9 +212,18 @@ function createError(status, message, retryAfterSeconds) {
 	return error;
 }
 
+function isUniqueConstraintError(error) {
+	return error?.code === '23505' || error?.message?.includes('UNIQUE constraint failed');
+}
+
 function positiveIntegerSetting(name, fallback) {
 	const value = Number(process.env[name]);
 	return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function usePostgresBackend() {
+	if (process.env.DB_BACKEND === 'sqlite') return false;
+	return process.env.DB_BACKEND === 'postgres' || Boolean(process.env.DATABASE_URL);
 }
 
 async function readBody(request) {
@@ -115,19 +297,19 @@ function clearSessionCookie(request) {
 	return sessionCookie('', 0, isSecureRequest(request));
 }
 
-function getAccountForRequest(request) {
+async function getAccountForRequest(request) {
 	const cookie = request.headers.cookie || '';
 	const token = cookie.match(/(?:^|;\s*)session=([a-f0-9]+)/)?.[1];
 	if (!token) return null;
 
 	const tokenHash = hashToken(token);
-	const session = queries.findSessionByToken.get(tokenHash);
+	const session = await queries.findSessionByToken.get(tokenHash);
 	if (!session || session.expires_at <= Date.now()) {
-		if (session) queries.deleteSessionByToken.run(tokenHash);
+		if (session) await queries.deleteSessionByToken.run(tokenHash);
 		return null;
 	}
 
-	const account = accountFromRow(queries.findById.get(session.account_id));
+	const account = accountFromRow(await queries.findById.get(session.account_id));
  	return account?.status === 'active' ? account : null;
 }
 
@@ -135,22 +317,22 @@ function getSessionToken(request) {
 	return (request.headers.cookie || '').match(/(?:^|;\s*)session=([a-f0-9]+)/)?.[1] || null;
 }
 
-function issueSession(accountId, userAgent = '') {
+async function issueSession(accountId, userAgent = '') {
 	const token = randomBytes(32).toString('hex');
 	const now = Date.now();
-	queries.insertSession.run(randomBytes(16).toString('hex'), hashToken(token), accountId, now, now + sessionLifetime, userAgent.slice(0, 300));
+	await queries.insertSession.run(randomBytes(16).toString('hex'), hashToken(token), accountId, now, now + sessionLifetime, userAgent.slice(0, 300));
 	return token;
 }
 
-function sessionCookieForRequest(request, accountId) {
+async function sessionCookieForRequest(request, accountId) {
 	return sessionCookie(
-		issueSession(accountId, request.headers['user-agent'] || ''),
+		await issueSession(accountId, request.headers['user-agent'] || ''),
 		Math.floor(sessionLifetime / 1000),
 		isSecureRequest(request)
 	);
 }
 
-function consumeRateLimit(request, scope, identifier, limit) {
+async function consumeRateLimit(request, scope, identifier, limit) {
 	const forwardedAddress = process.env.TRUST_PROXY === 'true'
 		? request.headers['x-forwarded-for']?.split(',')[0].trim()
 		: undefined;
@@ -160,30 +342,25 @@ function consumeRateLimit(request, scope, identifier, limit) {
 	const now = Date.now();
 	let retryAfterSeconds = 0;
 
-	database.exec('BEGIN IMMEDIATE');
-	try {
-		const bucket = queries.findRateLimit.get(bucketHash);
+	await withTransaction(async () => {
+		const bucket = await queries.findRateLimit.get(bucketHash);
 		if (!bucket || bucket.expires_at <= now) {
-			queries.resetRateLimit.run(bucketHash, now, now + rateLimitWindowMs);
+			await queries.resetRateLimit.run(bucketHash, now, now + rateLimitWindowMs);
 		} else if (bucket.attempts >= limit) {
 			retryAfterSeconds = Math.max(1, Math.ceil((bucket.expires_at - now) / 1000));
 		} else {
-			queries.incrementRateLimit.run(bucketHash);
+			await queries.incrementRateLimit.run(bucketHash);
 		}
-		queries.deleteExpiredRateLimits.run(now);
-		database.exec('COMMIT');
-	} catch (error) {
-		database.exec('ROLLBACK');
-		throw error;
-	}
+		await queries.deleteExpiredRateLimits.run(now);
+	});
 
 	if (retryAfterSeconds) {
 		throw createError(429, 'Too many requests. Please try again later.', retryAfterSeconds);
 	}
 }
 
-function recordAuditEvent(actor, action, affectedAccount = actor, metadata = {}) {
-	queries.insertAuditEvent.run(
+async function recordAuditEvent(actor, action, affectedAccount = actor, metadata = {}) {
+	await queries.insertAuditEvent.run(
 		actor?.id || null,
 		actor?.email || null,
 		action,
@@ -217,14 +394,11 @@ function hashToken(token) {
 	return createHash('sha256').update(token).digest('hex');
 }
 
-function createAccountToken(accountId, purpose, email, lifetime) {
+async function createAccountToken(accountId, purpose, email, lifetime) {
 	const token = randomBytes(32).toString('base64url');
 	const now = Date.now();
-	database.prepare('DELETE FROM account_tokens WHERE account_id = ? AND purpose = ? AND used_at IS NULL').run(accountId, purpose);
-	database.prepare(`
-		INSERT INTO account_tokens (token_hash, account_id, purpose, email, expires_at, used_at)
-		VALUES (?, ?, ?, ?, ?, NULL)
-	`).run(hashToken(token), accountId, purpose, email, now + lifetime);
+	await queries.deleteAccountTokensByPurpose.run(accountId, purpose);
+	await queries.insertAccountToken.run(hashToken(token), accountId, purpose, email, now + lifetime);
 	return token;
 }
 
@@ -266,62 +440,52 @@ async function sendAccountEmail(purpose, email, token) {
 	console.log(`[DEV EMAIL ${purpose}] ${email} ${url}`);
 }
 
-function readRedeemableToken(token, purpose) {
+async function readRedeemableToken(token, purpose) {
 	if (typeof token !== 'string' || token.length > 128) throw createError(400, 'This link is invalid.');
-	const record = queries.findToken.get(hashToken(token));
+	const record = await queries.findToken.get(hashToken(token));
 	if (!record || record.purpose !== purpose) throw createError(400, 'This link is invalid.');
 	if (record.used_at !== null) throw createError(409, 'This link has already been used.');
 	if (record.expires_at <= Date.now()) throw createError(410, 'This link has expired.');
 	return record;
 }
 
-function verifyEmailToken(token) {
-	database.exec('BEGIN IMMEDIATE');
-	try {
-		const record = readRedeemableToken(token, 'verify_email');
-		const account = accountFromRow(queries.findById.get(record.account_id));
+async function verifyEmailToken(token) {
+	return withTransaction(async () => {
+		const record = await readRedeemableToken(token, 'verify_email');
+		const account = accountFromRow(await queries.findById.get(record.account_id));
 		if (!account || (account.email !== record.email && account.pendingEmail !== record.email)) {
 			throw createError(400, 'This verification link is invalid.');
 		}
 		if (account.pendingEmail === record.email) {
-			const owner = queries.findEmailOwner.get(record.email, record.email, account.id);
+			const owner = await queries.findEmailOwner.get(record.email, record.email, account.id);
 			if (owner) throw createError(409, 'That email address is already associated with another account.');
 		}
-		queries.verifyEmail.run(record.email, new Date().toISOString(), account.id);
-		queries.markTokenUsed.run(Date.now(), record.token_hash);
-		database.exec('COMMIT');
+		await queries.verifyEmail.run(record.email, new Date().toISOString(), account.id);
+		await queries.markTokenUsed.run(Date.now(), record.token_hash);
 		return account;
-	} catch (error) {
-		database.exec('ROLLBACK');
-		throw error;
-	}
+	});
 }
 
 async function resetPasswordWithToken(token, password) {
 	if (!validatePassword(password)) throw createError(400, 'Password must be between 10 and 200 characters.');
-	const initialRecord = readRedeemableToken(token, 'password_reset');
-	const account = accountFromRow(queries.findById.get(initialRecord.account_id));
+	const initialRecord = await readRedeemableToken(token, 'password_reset');
+	const account = accountFromRow(await queries.findById.get(initialRecord.account_id));
 	if (!account || account.status !== 'active') throw createError(400, 'This link is invalid.');
 	const credentials = await hashPassword(password);
 
-	database.exec('BEGIN IMMEDIATE');
-	try {
-		const record = readRedeemableToken(token, 'password_reset');
+	await withTransaction(async () => {
+		const record = await readRedeemableToken(token, 'password_reset');
 		if (record.account_id !== account.id) throw createError(400, 'This link is invalid.');
-		queries.updatePassword.run(credentials.salt, credentials.passwordHash, account.id);
-		queries.markTokenUsed.run(Date.now(), record.token_hash);
-		queries.deleteAccountSessions.run(account.id);
-		recordAuditEvent(account, 'password.reset');
-		database.exec('COMMIT');
-	} catch (error) {
-		database.exec('ROLLBACK');
-		throw error;
-	}
+		await queries.updatePassword.run(credentials.salt, credentials.passwordHash, account.id);
+		await queries.markTokenUsed.run(Date.now(), record.token_hash);
+		await queries.deleteAccountSessions.run(account.id);
+		await recordAuditEvent(account, 'password.reset');
+	});
 }
 
 async function handleApi(request, response, url) {
 	if (url.pathname.startsWith('/api/admin/audit-events')) {
-		const administrator = getAccountForRequest(request);
+		const administrator = await getAccountForRequest(request);
 		if (!administrator) throw createError(401, 'Please sign in to continue.');
 		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
 		if (request.method !== 'GET' || url.pathname !== '/api/admin/audit-events') {
@@ -334,8 +498,8 @@ async function handleApi(request, response, url) {
 		const limit = Math.min(100, Math.max(1, Math.floor(requestedLimit)));
 		const offset = Math.min(1000000, Math.max(0, Math.floor(requestedOffset)));
 		const filters = [search, search, search, search, search, search];
-		const total = queries.countAuditEvents.get(...filters).count;
-		const events = queries.listAuditEvents.all(...filters, limit, offset).map(event => ({
+		const total = (await queries.countAuditEvents.get(...filters)).count;
+		const events = (await queries.listAuditEvents.all(...filters, limit, offset)).map(event => ({
 			id: event.event_id,
 			actorAccountId: event.actor_account_id,
 			actorEmail: event.actor_email,
@@ -350,20 +514,20 @@ async function handleApi(request, response, url) {
 
 	if (request.method === 'POST' && url.pathname === '/api/email/verify') {
 		const body = await readBody(request);
-		const account = verifyEmailToken(body.token);
-		return sendJson(response, 200, { verified: true, account: publicAccount(accountFromRow(queries.findById.get(account.id))) });
+		const account = await verifyEmailToken(body.token);
+		return sendJson(response, 200, { verified: true, account: publicAccount(accountFromRow(await queries.findById.get(account.id))) });
 	}
 
 	if (request.method === 'POST' && url.pathname === '/api/password-reset/request') {
-		consumeRateLimit(request, 'password-reset:ip', undefined, positiveIntegerSetting('RATE_LIMIT_PASSWORD_RESET_IP_MAX', 10));
+		await consumeRateLimit(request, 'password-reset:ip', undefined, positiveIntegerSetting('RATE_LIMIT_PASSWORD_RESET_IP_MAX', 10));
 		const body = await readBody(request);
 		const email = normalizeEmail(body.email);
 		if (validateEmail(email)) {
-			consumeRateLimit(request, 'password-reset:email', email, positiveIntegerSetting('RATE_LIMIT_PASSWORD_RESET_EMAIL_MAX', 4));
+			await consumeRateLimit(request, 'password-reset:email', email, positiveIntegerSetting('RATE_LIMIT_PASSWORD_RESET_EMAIL_MAX', 4));
 		}
-		const account = accountFromRow(queries.findByEmail.get(email));
+		const account = accountFromRow(await queries.findByEmail.get(email));
 		if (account && account.status === 'active' && account.emailVerifiedAt) {
-			const token = createAccountToken(account.id, 'password_reset', account.email, resetLifetime);
+			const token = await createAccountToken(account.id, 'password_reset', account.email, resetLifetime);
 			try {
 				await sendAccountEmail('password_reset', account.email, token);
 			} catch {
@@ -380,7 +544,7 @@ async function handleApi(request, response, url) {
 	}
 
 	if (url.pathname.startsWith('/api/admin/accounts')) {
-		const administrator = getAccountForRequest(request);
+		const administrator = await getAccountForRequest(request);
 		if (!administrator) throw createError(401, 'Please sign in to continue.');
 		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
 
@@ -394,8 +558,8 @@ async function handleApi(request, response, url) {
 				? url.searchParams.get('status')
 				: 'all';
 			const filters = [search, search, search, status, status];
-			const total = queries.countAccounts.get(...filters).count;
-			const accountList = queries.listAccounts.all(...filters, limit, offset)
+			const total = (await queries.countAccounts.get(...filters)).count;
+			const accountList = (await queries.listAccounts.all(...filters, limit, offset))
 				.map(row => publicAccount(accountFromRow(row)));
 			return sendJson(response, 200, { accounts: accountList, total, limit, offset });
 		}
@@ -404,23 +568,18 @@ async function handleApi(request, response, url) {
 		if (request.method === 'PATCH' && roleMatch) {
 			const body = await readBody(request);
 			if (!['user', 'admin'].includes(body.role)) throw createError(400, 'Role must be user or admin.');
-			const target = accountFromRow(queries.findById.get(roleMatch[1]));
+			const target = accountFromRow(await queries.findById.get(roleMatch[1]));
 			if (!target) throw createError(404, 'Account not found.');
 
-			database.exec('BEGIN IMMEDIATE');
-			try {
-				if (target.role === 'admin' && body.role === 'user' && queries.adminCount.get().count <= 1) {
+			await withTransaction(async () => {
+				if (target.role === 'admin' && body.role === 'user' && (await queries.adminCount.get()).count <= 1) {
 					throw createError(409, 'The last administrator cannot be demoted.');
 				}
 				if (target.role !== body.role) {
-					queries.updateRole.run(body.role, target.id);
-					recordAuditEvent(administrator, 'role.changed', target, { from: target.role, to: body.role });
+					await queries.updateRole.run(body.role, target.id);
+					await recordAuditEvent(administrator, 'role.changed', target, { from: target.role, to: body.role });
 				}
-				database.exec('COMMIT');
-			} catch (error) {
-				database.exec('ROLLBACK');
-				throw error;
-			}
+			});
 			return sendJson(response, 200, { account: { ...publicAccount(target), role: body.role } });
 		}
 
@@ -430,28 +589,23 @@ async function handleApi(request, response, url) {
 			if (!['active', 'suspended'].includes(body.status)) {
 				throw createError(400, 'Status must be active or suspended.');
 			}
-			const target = accountFromRow(queries.findById.get(statusMatch[1]));
+			const target = accountFromRow(await queries.findById.get(statusMatch[1]));
 			if (!target) throw createError(404, 'Account not found.');
 			if (target.id === administrator.id && body.status === 'suspended') {
 				throw createError(409, 'You cannot suspend your own administrator account.');
 			}
 
-			database.exec('BEGIN IMMEDIATE');
-			try {
-				if (target.role === 'admin' && body.status === 'suspended' && queries.activeAdminCount.get().count <= 1) {
+			await withTransaction(async () => {
+				if (target.role === 'admin' && body.status === 'suspended' && (await queries.activeAdminCount.get()).count <= 1) {
 					throw createError(409, 'The last active administrator cannot be suspended.');
 				}
 				if (target.status !== body.status) {
-					queries.updateStatus.run(body.status, target.id);
-					if (body.status === 'suspended') queries.deleteAccountSessions.run(target.id);
+					await queries.updateStatus.run(body.status, target.id);
+					if (body.status === 'suspended') await queries.deleteAccountSessions.run(target.id);
 					const action = body.status === 'suspended' ? 'account.suspended' : 'account.reactivated';
-					recordAuditEvent(administrator, action, target, { from: target.status, to: body.status });
+					await recordAuditEvent(administrator, action, target, { from: target.status, to: body.status });
 				}
-				database.exec('COMMIT');
-			} catch (error) {
-				database.exec('ROLLBACK');
-				throw error;
-			}
+			});
 			return sendJson(response, 200, { account: { ...publicAccount(target), status: body.status } });
 		}
 
@@ -459,7 +613,7 @@ async function handleApi(request, response, url) {
 	}
 
 	if (request.method === 'POST' && url.pathname === '/api/register') {
-		consumeRateLimit(request, 'registration:ip', undefined, positiveIntegerSetting('RATE_LIMIT_REGISTRATION_IP_MAX', 15));
+		await consumeRateLimit(request, 'registration:ip', undefined, positiveIntegerSetting('RATE_LIMIT_REGISTRATION_IP_MAX', 15));
 		const body = await readBody(request);
 		const email = normalizeEmail(body.email);
 		const displayName = typeof body.displayName === 'string' ? body.displayName.trim() : '';
@@ -467,8 +621,8 @@ async function handleApi(request, response, url) {
 		if (!displayName || displayName.length > 80) throw createError(400, 'Enter a name of 1 to 80 characters.');
 		if (!validateEmail(email)) throw createError(400, 'Enter a valid email address.');
 		if (!validatePassword(body.password)) throw createError(400, 'Password must be between 10 and 200 characters.');
-		consumeRateLimit(request, 'registration:email', email, positiveIntegerSetting('RATE_LIMIT_REGISTRATION_EMAIL_MAX', 3));
-		if (queries.findByEmail.get(email)) {
+		await consumeRateLimit(request, 'registration:email', email, positiveIntegerSetting('RATE_LIMIT_REGISTRATION_EMAIL_MAX', 3));
+		if (await queries.findByEmail.get(email)) {
 			throw createError(409, 'An account already uses that email address.');
 		}
 
@@ -483,47 +637,47 @@ async function handleApi(request, response, url) {
 			...credentials
 		};
 		try {
-			queries.insert.run(account.id, account.email, account.displayName, account.createdAt, account.role, account.status, account.salt, account.passwordHash);
+			await queries.insert.run(account.id, account.email, account.displayName, account.createdAt, account.role, account.status, account.salt, account.passwordHash);
 		} catch (error) {
-			if (error.message.includes('UNIQUE constraint failed')) {
+			if (isUniqueConstraintError(error)) {
 				throw createError(409, 'An account already uses that email address.');
 			}
 			throw error;
 		}
-		const verificationToken = createAccountToken(account.id, 'verify_email', account.email, verificationLifetime);
+		const verificationToken = await createAccountToken(account.id, 'verify_email', account.email, verificationLifetime);
 		await sendAccountEmail('verify_email', account.email, verificationToken);
 		return sendJson(response, 201, { account: publicAccount(account) }, {
-			'Set-Cookie': sessionCookieForRequest(request, account.id)
+			'Set-Cookie': await sessionCookieForRequest(request, account.id)
 		});
 	}
 
 	if (request.method === 'POST' && url.pathname === '/api/login') {
-		consumeRateLimit(request, 'sign-in:ip', undefined, positiveIntegerSetting('RATE_LIMIT_SIGN_IN_IP_MAX', 20));
+		await consumeRateLimit(request, 'sign-in:ip', undefined, positiveIntegerSetting('RATE_LIMIT_SIGN_IN_IP_MAX', 20));
 		const body = await readBody(request);
 		const email = normalizeEmail(body.email);
 		if (validateEmail(email)) {
-			consumeRateLimit(request, 'sign-in:email', email, positiveIntegerSetting('RATE_LIMIT_SIGN_IN_EMAIL_MAX', 8));
+			await consumeRateLimit(request, 'sign-in:email', email, positiveIntegerSetting('RATE_LIMIT_SIGN_IN_EMAIL_MAX', 8));
 		}
-		const account = accountFromRow(queries.findByEmail.get(email));
+		const account = accountFromRow(await queries.findByEmail.get(email));
 		const password = typeof body.password === 'string' ? body.password : '';
 		const validPassword = await passwordMatches(password, account || dummyPasswordCredentials);
 		if (!account || !validPassword || account.status !== 'active') {
 			throw createError(401, 'Email or password is incorrect.');
 		}
 
-		recordAuditEvent(account, 'sign_in.succeeded');
+		await recordAuditEvent(account, 'sign_in.succeeded');
 		return sendJson(response, 200, { account: publicAccount(account) }, {
-			'Set-Cookie': sessionCookieForRequest(request, account.id)
+			'Set-Cookie': await sessionCookieForRequest(request, account.id)
 		});
 	}
 
 	if (request.method === 'POST' && url.pathname === '/api/logout') {
 		const token = getSessionToken(request);
-		if (token) queries.deleteSessionByToken.run(hashToken(token));
+		if (token) await queries.deleteSessionByToken.run(hashToken(token));
 		return sendJson(response, 200, { ok: true }, { 'Set-Cookie': clearSessionCookie(request) });
 	}
 
-	const account = getAccountForRequest(request);
+	const account = await getAccountForRequest(request);
 	if (!account) throw createError(401, 'Please sign in to continue.');
 
 	if (request.method === 'GET' && url.pathname === '/api/me') {
@@ -533,7 +687,7 @@ async function handleApi(request, response, url) {
 	if (request.method === 'GET' && url.pathname === '/api/me/sessions') {
 		const currentToken = getSessionToken(request);
 		const currentHash = currentToken ? hashToken(currentToken) : null;
-		const activeSessions = queries.listSessions.all(account.id, Date.now()).map(session => ({
+		const activeSessions = (await queries.listSessions.all(account.id, Date.now())).map(session => ({
 			id: session.session_id,
 			createdAt: new Date(session.created_at).toISOString(),
 			expiresAt: new Date(session.expires_at).toISOString(),
@@ -545,10 +699,10 @@ async function handleApi(request, response, url) {
 
 	const sessionMatch = url.pathname.match(/^\/api\/me\/sessions\/([a-f0-9]+)$/);
 	if (request.method === 'DELETE' && sessionMatch) {
-		const session = queries.findSessionById.get(sessionMatch[1], account.id, Date.now());
+		const session = await queries.findSessionById.get(sessionMatch[1], account.id, Date.now());
 		if (!session) throw createError(404, 'Active session not found.');
 		const current = session.token_hash === hashToken(getSessionToken(request) || '');
-		queries.deleteSessionById.run(session.session_id, account.id);
+		await queries.deleteSessionById.run(session.session_id, account.id);
 		return sendJson(response, 200, { revoked: true, current }, current
 			? { 'Set-Cookie': clearSessionCookie(request) }
 			: {});
@@ -563,32 +717,29 @@ async function handleApi(request, response, url) {
 		if (!validateEmail(email)) throw createError(400, 'Enter a valid email address.');
 		const changingEmail = email !== account.email && email !== account.pendingEmail;
 		if (changingEmail) {
-			if (queries.findEmailOwner.get(email, email, account.id)) {
+			if (await queries.findEmailOwner.get(email, email, account.id)) {
 				throw createError(409, 'An account already uses that email address.');
 			}
 		}
 		const changedFields = [];
 		if (displayName !== account.displayName) changedFields.push('displayName');
 		if (changingEmail) changedFields.push('email');
-		database.exec('BEGIN IMMEDIATE');
-		try {
-			queries.update.run(displayName, account.id);
-			if (changingEmail) queries.updatePendingEmail.run(email, account.id);
+		await withTransaction(async () => {
+			await queries.update.run(displayName, account.id);
+			if (changingEmail) await queries.updatePendingEmail.run(email, account.id);
 			if (changedFields.length > 0) {
-				recordAuditEvent(account, 'profile.updated', account, { changedFields });
+				await recordAuditEvent(account, 'profile.updated', account, { changedFields });
 			}
-			database.exec('COMMIT');
-		} catch (error) {
-			database.exec('ROLLBACK');
-			if (error.message.includes('UNIQUE constraint failed')) {
+		}).catch(error => {
+			if (isUniqueConstraintError(error)) {
 				throw createError(409, 'An account already uses that email address.');
 			}
 			throw error;
-		}
+		});
 		account.displayName = displayName;
 		if (changingEmail) {
 			account.pendingEmail = email;
-			const verificationToken = createAccountToken(account.id, 'verify_email', email, verificationLifetime);
+			const verificationToken = await createAccountToken(account.id, 'verify_email', email, verificationLifetime);
 			await sendAccountEmail('verify_email', email, verificationToken);
 		}
 		return sendJson(response, 200, { account: publicAccount(account) });
@@ -599,7 +750,7 @@ async function handleApi(request, response, url) {
 			throw createError(409, 'Your current email address is already verified.');
 		}
 		const email = account.pendingEmail || account.email;
-		const token = createAccountToken(account.id, 'verify_email', email, verificationLifetime);
+		const token = await createAccountToken(account.id, 'verify_email', email, verificationLifetime);
 		await sendAccountEmail('verify_email', email, token);
 		return sendJson(response, 200, { message: `A verification link has been sent to ${email}.` });
 	}
@@ -617,19 +768,14 @@ async function handleApi(request, response, url) {
 		}
 
 		const credentials = await hashPassword(body.newPassword);
-		database.exec('BEGIN IMMEDIATE');
-		try {
-			queries.updatePassword.run(credentials.salt, credentials.passwordHash, account.id);
-			queries.invalidateAccountTokens.run(account.id);
-			queries.deleteAccountSessions.run(account.id);
-			recordAuditEvent(account, 'password.changed');
-			database.exec('COMMIT');
-		} catch (error) {
-			database.exec('ROLLBACK');
-			throw error;
-		}
+		await withTransaction(async () => {
+			await queries.updatePassword.run(credentials.salt, credentials.passwordHash, account.id);
+			await queries.invalidateAccountTokens.run(account.id);
+			await queries.deleteAccountSessions.run(account.id);
+			await recordAuditEvent(account, 'password.changed');
+		});
 		return sendJson(response, 200, { message: 'Password changed successfully.' }, {
-			'Set-Cookie': sessionCookieForRequest(request, account.id)
+			'Set-Cookie': await sessionCookieForRequest(request, account.id)
 		});
 	}
 
@@ -639,15 +785,10 @@ async function handleApi(request, response, url) {
 			throw createError(401, 'Enter your current password to delete this account.');
 		}
 
-		database.exec('BEGIN IMMEDIATE');
-		try {
-			recordAuditEvent(account, 'account.deleted', account, { source: 'self_service' });
-			queries.delete.run(account.id);
-			database.exec('COMMIT');
-		} catch (error) {
-			database.exec('ROLLBACK');
-			throw error;
-		}
+		await withTransaction(async () => {
+			await recordAuditEvent(account, 'account.deleted', account, { source: 'self_service' });
+			await queries.delete.run(account.id);
+		});
 		return sendJson(response, 200, { ok: true }, { 'Set-Cookie': clearSessionCookie(request) });
 	}
 
@@ -655,6 +796,23 @@ async function handleApi(request, response, url) {
 }
 
 async function initializeDatabase() {
+	if (usePostgresBackend()) {
+		if (!process.env.DATABASE_URL) throw new Error('DB_BACKEND=postgres requires DATABASE_URL.');
+		postgresPool = new Pool({
+			connectionString: normalizedPostgresConnectionString(),
+			ssl: await postgresSslConfig(),
+			max: positiveIntegerSetting('DATABASE_POOL_SIZE', 10),
+			connectionTimeoutMillis: 10000,
+			idleTimeoutMillis: 30000
+		});
+		await postgresPool.query('SELECT 1');
+		const schema = await fs.readFile(path.join(root, 'supabase', 'migrations', '20261031_initial_schema.sql'), 'utf8');
+		await executeScript(schema);
+		queries = buildQueries();
+		await queries.deleteExpiredSessions.run(Date.now());
+		return;
+	}
+
 	try {
 		await fs.mkdir(path.dirname(databaseFile), { recursive: true });
 		database = new DatabaseSync(databaseFile);
@@ -738,92 +896,13 @@ async function initializeDatabase() {
 				CREATE INDEX IF NOT EXISTS account_tokens_account_purpose
 					ON account_tokens (account_id, purpose, expires_at);
 			`);
-		queries = {
-			findById: database.prepare('SELECT * FROM accounts WHERE id = ?'),
-			findByEmail: database.prepare('SELECT * FROM accounts WHERE email = ?'),
-			insertSession: database.prepare(`
-				INSERT INTO sessions (session_id, token_hash, account_id, created_at, expires_at, user_agent)
-				VALUES (?, ?, ?, ?, ?, ?)
-			`),
-			findSessionByToken: database.prepare('SELECT * FROM sessions WHERE token_hash = ?'),
-			deleteSessionByToken: database.prepare('DELETE FROM sessions WHERE token_hash = ?'),
-			listSessions: database.prepare('SELECT * FROM sessions WHERE account_id = ? AND expires_at > ? ORDER BY created_at DESC'),
-			findSessionById: database.prepare('SELECT * FROM sessions WHERE session_id = ? AND account_id = ? AND expires_at > ?'),
-			deleteSessionById: database.prepare('DELETE FROM sessions WHERE session_id = ? AND account_id = ?'),
-			deleteAccountSessions: database.prepare('DELETE FROM sessions WHERE account_id = ?'),
-			deleteExpiredSessions: database.prepare('DELETE FROM sessions WHERE expires_at <= ?'),
-			findRateLimit: database.prepare('SELECT * FROM rate_limits WHERE bucket_hash = ?'),
-			resetRateLimit: database.prepare(`
-				INSERT INTO rate_limits (bucket_hash, window_started_at, attempts, expires_at)
-				VALUES (?, ?, 1, ?)
-				ON CONFLICT(bucket_hash) DO UPDATE SET
-					window_started_at = excluded.window_started_at,
-					attempts = 1,
-					expires_at = excluded.expires_at
-			`),
-			incrementRateLimit: database.prepare('UPDATE rate_limits SET attempts = attempts + 1 WHERE bucket_hash = ?'),
-			deleteExpiredRateLimits: database.prepare('DELETE FROM rate_limits WHERE expires_at <= ?'),
-			insertAuditEvent: database.prepare(`
-				INSERT INTO audit_events (
-					actor_account_id, actor_email, action, affected_account_id,
-					affected_email, occurred_at, metadata_json
-				) VALUES (?, ?, ?, ?, ?, ?, ?)
-			`),
-			countAuditEvents: database.prepare(`
-				SELECT COUNT(*) AS count FROM audit_events
-				WHERE (? = '' OR instr(lower(action), lower(?)) > 0
-					OR instr(lower(actor_email), lower(?)) > 0
-					OR instr(lower(affected_email), lower(?)) > 0
-					OR instr(lower(COALESCE(actor_account_id, '')), lower(?)) > 0
-					OR instr(lower(COALESCE(affected_account_id, '')), lower(?)) > 0)
-			`),
-			listAuditEvents: database.prepare(`
-				SELECT * FROM audit_events
-				WHERE (? = '' OR instr(lower(action), lower(?)) > 0
-					OR instr(lower(actor_email), lower(?)) > 0
-					OR instr(lower(affected_email), lower(?)) > 0
-					OR instr(lower(COALESCE(actor_account_id, '')), lower(?)) > 0
-					OR instr(lower(COALESCE(affected_account_id, '')), lower(?)) > 0)
-				ORDER BY occurred_at DESC, event_id DESC
-				LIMIT ? OFFSET ?
-			`),
-				findEmailOwner: database.prepare('SELECT id FROM accounts WHERE (email = ? OR pending_email = ?) AND id <> ?'),
-			insert: database.prepare(`
-				INSERT INTO accounts (id, email, display_name, created_at, role, status, salt, password_hash)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			`),
-			update: database.prepare('UPDATE accounts SET display_name = ? WHERE id = ?'),
-			updatePendingEmail: database.prepare('UPDATE accounts SET pending_email = ? WHERE id = ?'),
-			verifyEmail: database.prepare('UPDATE accounts SET email = ?, pending_email = NULL, email_verified_at = ? WHERE id = ?'),
-			updatePassword: database.prepare('UPDATE accounts SET salt = ?, password_hash = ? WHERE id = ?'),
-			updateRole: database.prepare('UPDATE accounts SET role = ? WHERE id = ?'),
-			updateStatus: database.prepare('UPDATE accounts SET status = ? WHERE id = ?'),
-			delete: database.prepare('DELETE FROM accounts WHERE id = ?'),
-				count: database.prepare('SELECT COUNT(*) AS count FROM accounts'),
-				adminCount: database.prepare("SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin'"),
-			activeAdminCount: database.prepare("SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin' AND status = 'active'"),
-			findToken: database.prepare('SELECT * FROM account_tokens WHERE token_hash = ?'),
-			markTokenUsed: database.prepare('UPDATE account_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL'),
-			invalidateAccountTokens: database.prepare('DELETE FROM account_tokens WHERE account_id = ? AND used_at IS NULL'),
-			countAccounts: database.prepare(`
-				SELECT COUNT(*) AS count FROM accounts
-				WHERE (? = '' OR instr(lower(display_name), lower(?)) > 0 OR instr(lower(email), lower(?)) > 0)
-				AND (? = 'all' OR status = ?)
-			`),
-			listAccounts: database.prepare(`
-				SELECT * FROM accounts
-				WHERE (? = '' OR instr(lower(display_name), lower(?)) > 0 OR instr(lower(email), lower(?)) > 0)
-				AND (? = 'all' OR status = ?)
-				ORDER BY created_at DESC, id
-				LIMIT ? OFFSET ?
-			`)
-		};
-		queries.deleteExpiredSessions.run(Date.now());
+		queries = buildQueries();
+		await queries.deleteExpiredSessions.run(Date.now());
 	} catch (error) {
 		if (error.code !== 'ENOENT') throw error;
 	}
 
-	if (queries.count.get().count > 0) return;
+	if ((await queries.count.get()).count > 0) return;
 	let savedAccounts;
 	try {
 		savedAccounts = JSON.parse(await fs.readFile(dataFile, 'utf8'));
@@ -833,41 +912,32 @@ async function initializeDatabase() {
 	}
 	if (!Array.isArray(savedAccounts)) throw new Error('Legacy account data must be an array.');
 
-	const insertLegacy = database.prepare(`
-		INSERT OR IGNORE INTO accounts (id, email, display_name, created_at, role, status, salt, password_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`);
-	database.exec('BEGIN');
-	try {
+	await withTransaction(async () => {
+		const insertLegacy = prepareQuery(`
+			INSERT OR IGNORE INTO accounts (id, email, display_name, created_at, role, status, salt, password_hash)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`);
 		for (const account of savedAccounts) {
-			insertLegacy.run(account.id, account.email, account.displayName, account.createdAt, account.role || 'user', account.status || 'active', account.salt, account.passwordHash);
+			await insertLegacy.run(account.id, account.email, account.displayName, account.createdAt, account.role || 'user', account.status || 'active', account.salt, account.passwordHash);
 		}
-		database.exec('COMMIT');
-	} catch (error) {
-		database.exec('ROLLBACK');
-		throw error;
-	}
+	});
 }
 
 async function promoteFirstAdmin(email) {
 	const normalizedEmail = normalizeEmail(email);
 	if (!validateEmail(normalizedEmail)) throw new Error('Provide a valid email address for an existing account.');
 
-	database.exec('BEGIN IMMEDIATE');
-	try {
-		if (queries.adminCount.get().count > 0) {
+	let account;
+	await withTransaction(async () => {
+		if ((await queries.adminCount.get()).count > 0) {
 			throw new Error('An administrator already exists; first-admin promotion is one-time.');
 		}
-		const account = queries.findByEmail.get(normalizedEmail);
+		account = await queries.findByEmail.get(normalizedEmail);
 		if (!account) throw new Error('No account found for that email. Register the account before promoting it.');
-		database.prepare("UPDATE accounts SET role = 'admin' WHERE id = ?").run(account.id);
-		recordAuditEvent(null, 'role.changed', account, { from: 'user', to: 'admin', source: 'first_admin_setup' });
-		database.exec('COMMIT');
-		console.log(`Promoted ${account.email} to the first administrator.`);
-	} catch (error) {
-		database.exec('ROLLBACK');
-		throw error;
-	}
+		await queries.updateRole.run('admin', account.id);
+		await recordAuditEvent(null, 'role.changed', account, { from: 'user', to: 'admin', source: 'first_admin_setup' });
+	});
+	console.log(`Promoted ${account.email} to the first administrator.`);
 }
 
 function validateProductionConfig() {
@@ -880,6 +950,15 @@ function validateProductionConfig() {
 	}
 	if (publicUrl.protocol !== 'https:') {
 		throw new Error('Production requires APP_BASE_URL to use HTTPS.');
+	}
+	if (!process.env.DATABASE_URL) {
+		throw new Error('Production requires DATABASE_URL for Supabase Postgres.');
+	}
+	if (!process.env.DATABASE_SSL_CA) {
+		throw new Error('Production requires DATABASE_SSL_CA to verify the Supabase database certificate.');
+	}
+	if (!usePostgresBackend()) {
+		throw new Error('Production requires DB_BACKEND=postgres.');
 	}
 	if (process.env.TRUST_PROXY !== 'true') {
 		throw new Error('Production requires TRUST_PROXY=true behind the HTTPS reverse proxy.');
@@ -897,7 +976,7 @@ async function start() {
 		const url = new URL(request.url, 'http://localhost');
 
 		if (request.method === 'GET' && (url.pathname === '/admin' || url.pathname === '/admin/audit' || url.pathname === '/sessions')) {
-			const account = getAccountForRequest(request);
+			const account = await getAccountForRequest(request);
 			if (!account) return sendJson(response, 401, { error: 'Please sign in to continue.' });
 			if ((url.pathname === '/admin' || url.pathname === '/admin/audit') && account.role !== 'admin') {
 				return sendJson(response, 403, { error: 'Administrator access is required.' });

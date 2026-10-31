@@ -1,0 +1,891 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f2f4ef">
+  <title>Account desk</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f3f6f2;
+      --surface: #ffffff;
+      --ink: #18312d;
+      --muted: #64756f;
+      --line: #d8e1da;
+      --green: #17684d;
+      --green-dark: #104c39;
+      --coral: #c65e48;
+      --danger: #a53d35;
+      --focus: rgba(23, 104, 77, .2);
+      font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #f8faf7 0, var(--paper) 320px);
+      font-synthesis: none;
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; min-height: 100vh; background: transparent; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+    .topbar {
+      min-height: 68px;
+      padding: 0 max(24px, calc((100vw - 1160px) / 2));
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, .88);
+      backdrop-filter: blur(12px);
+    }
+
+    .brand { display: flex; align-items: center; gap: 11px; font-size: 12px; font-weight: 750; letter-spacing: .08em; }
+    .brand-mark { width: 32px; height: 32px; display: grid; place-items: center; background: var(--green); color: white; border-radius: 9px; font: 19px Georgia, serif; box-shadow: 0 3px 8px rgba(16, 76, 57, .14); }
+    .top-label { color: var(--muted); font-size: 12px; font-weight: 600; }
+    main { width: min(1160px, calc(100% - 48px)); margin: 0 auto; padding: 52px 0 80px; }
+    .layout { display: grid; grid-template-columns: minmax(220px, .68fr) minmax(0, 1.32fr); gap: clamp(32px, 6vw, 76px); align-items: start; }
+    .layout.workspace-layout { display: block; }
+    .intro { padding: 20px 0 0; animation: appear .5s ease both; }
+    .eyebrow { color: var(--green); text-transform: uppercase; letter-spacing: .12em; font-weight: 700; font-size: 10px; }
+    h1 { margin: 16px 0 12px; font: 400 40px/1.1 Georgia, "Times New Roman", serif; letter-spacing: 0; }
+    .intro-note { color: var(--muted); line-height: 1.65; max-width: 290px; font-size: 14px; }
+    .accent-rule { height: 3px; width: 42px; margin-top: 26px; background: var(--coral); }
+    .workspace { min-height: 360px; padding: 34px 38px; border: 1px solid rgba(216, 225, 218, .9); border-radius: 8px; background: var(--surface); box-shadow: 0 12px 36px rgba(27, 55, 42, .055); animation: appear .45s ease both; }
+    .workspace-layout .workspace { min-height: 0; padding: 4px 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; animation: none; }
+    .tabs { display: flex; width: fit-content; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 7px; margin: 0 0 28px; background: #f5f8f5; }
+    .tab { min-height: 34px; padding: 0 13px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 650; transition: background .16s ease, color .16s ease, box-shadow .16s ease; }
+    .tab[aria-selected="true"] { background: white; color: var(--green-dark); box-shadow: 0 1px 3px rgba(24, 49, 45, .12); }
+    h2 { margin: 0 0 7px; font: 400 27px/1.2 Georgia, "Times New Roman", serif; }
+    .subheading { margin: 0 0 24px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .field { display: grid; gap: 7px; margin: 17px 0; }
+    label { color: #344840; font-size: 11px; font-weight: 700; }
+    input { width: 100%; height: 46px; padding: 0 13px; border: 1px solid #cbd6ce; border-radius: 6px; background: #fff; color: var(--ink); outline: none; transition: border-color .16s ease, box-shadow .16s ease; }
+    input::placeholder { color: #8a9992; }
+    input:focus { border-color: var(--green); box-shadow: 0 0 0 3px var(--focus); }
+    .primary, .secondary, .danger { min-height: 42px; padding: 0 16px; border-radius: 6px; font-weight: 700; font-size: 12px; transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease; }
+    .primary { border: 1px solid var(--green); background: var(--green); color: white; }
+    .primary:hover { background: var(--green-dark); transform: translateY(-1px); }
+    .secondary { border: 1px solid var(--line); background: white; color: var(--ink); }
+    .secondary:hover { border-color: #9eb4a6; background: #f9fbf9; }
+    .danger { border: 1px solid #e8c8c3; background: #fff; color: var(--danger); }
+    .danger:hover { border-color: var(--danger); background: #fff8f6; }
+    button:disabled { opacity: .48; cursor: not-allowed; transform: none; }
+    .form-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-top: 22px; }
+    .message { min-height: 18px; margin: 12px 0 0; color: var(--danger); font-size: 12px; line-height: 1.5; }
+    .message:not(:empty) { padding: 9px 11px; border: 1px solid #f0d7d2; border-radius: 5px; background: #fff8f6; }
+    .message.success { color: var(--green-dark); }
+    .message.success:not(:empty) { border-color: #d2e7d8; background: #f2f8f3; }
+    [hidden] { display: none !important; }
+    .account-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 24px; }
+    .account-heading .form-actions { justify-content: flex-end; margin-top: 0 !important; }
+    .account-summary { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .account-meta { margin: 22px 0 0; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+    .danger-zone { margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--line); }
+    .danger-zone h3 { margin: 0 0 6px; font-size: 13px; }
+    .danger-zone p { margin: 0 0 14px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .confirm-row { display: flex; gap: 10px; align-items: end; }
+    .confirm-row .field { flex: 1; margin: 0; }
+    .inline-action { padding: 0; border: 0; background: transparent; color: var(--green); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
+    .account-section { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--line); }
+    .account-section h3 { margin: 0 0 6px; font-size: 14px; }
+    .account-section-note { margin: 0 0 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .email-status { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 16px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px; background: #f7faf7; font-size: 12px; line-height: 1.5; }
+    .email-status strong { color: var(--green-dark); }
+    .session-list { display: grid; gap: 10px; margin-top: 20px; }
+    .session-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 15px 16px; border: 1px solid var(--line); border-radius: 6px; background: white; }
+    .session-device { font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+    .session-meta { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .session-current { display: inline-block; margin-left: 8px; color: var(--green); font-size: 10px; font-weight: 700; }
+    .empty-sessions { padding: 20px 0; color: var(--muted); font-size: 13px; }
+    .admin-toolbar { display: grid; grid-template-columns: minmax(180px, 1fr) 170px auto; gap: 12px; align-items: end; margin: 22px 0 18px; padding: 14px; border: 1px solid var(--line); border-radius: 7px; background: rgba(255, 255, 255, .72); }
+    .admin-toolbar .field { margin: 0; }
+    select { height: 42px; padding: 0 10px; border: 1px solid #cbd6ce; border-radius: 4px; background: white; color: var(--ink); font: inherit; }
+    .table-scroll { overflow-x: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .account-table { width: 100%; min-width: 760px; border-collapse: collapse; text-align: left; font-size: 12px; }
+    .account-table th { padding: 11px 12px; color: var(--muted); background: #f7f9f7; font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
+    .account-table td { padding: 12px; border-top: 1px solid var(--line); vertical-align: middle; }
+    .account-table tbody tr:hover { background: #f9fbf9; }
+    .account-name { font-weight: 650; }
+    .account-email { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
+    .role-controls { display: flex; align-items: center; gap: 6px; }
+    .role-controls select { height: 34px; font-size: 12px; }
+    .small-button { min-height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 5px; background: white; color: var(--ink); font-size: 11px; font-weight: 700; transition: background .16s ease, border-color .16s ease; }
+    .small-button:hover { border-color: var(--green); }
+    .small-button.danger { color: var(--danger); border-color: #e8c8c3; }
+    .status-badge { display: inline-block; padding: 5px 8px; border-radius: 3px; background: #e7f2eb; color: var(--green-dark); font-size: 10px; font-weight: 700; }
+    .status-badge.suspended { background: #faeae7; color: var(--danger); }
+    .admin-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 16px; color: var(--muted); font-size: 12px; }
+    .audit-table { width: 100%; min-width: 860px; border-collapse: collapse; text-align: left; font-size: 12px; }
+    .audit-table th { padding: 11px 12px; color: var(--muted); background: #f7f9f7; font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
+    .audit-table td { padding: 12px; border-top: 1px solid var(--line); vertical-align: top; }
+    .audit-table tbody tr:hover { background: #f9fbf9; }
+    .audit-action { color: var(--green-dark); font-weight: 700; }
+    .audit-metadata { color: var(--muted); overflow-wrap: anywhere; }
+    .pagination { display: flex; gap: 8px; }
+    .pagination button:disabled { opacity: .45; cursor: default; }
+    @keyframes appear { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+    @media (max-width: 700px) {
+      .topbar { min-height: 60px; padding: 0 20px; }
+      main { width: min(100% - 36px, 620px); padding: 30px 0 52px; }
+      .layout { grid-template-columns: 1fr; gap: 20px; }
+      .intro { padding-top: 0; }
+      h1 { margin: 10px 0 8px; font-size: 34px; }
+      .intro-note { max-width: none; margin: 0; }
+      .accent-rule { display: none; }
+      .workspace { padding: 25px 22px; }
+      .workspace-layout .workspace { padding: 0; }
+      .account-heading { align-items: flex-start; flex-direction: column; }
+      .account-heading .form-actions { justify-content: flex-start; }
+      .admin-toolbar { grid-template-columns: minmax(0, 1fr) 145px; padding: 12px; }
+      .admin-toolbar .primary { grid-column: 1 / -1; }
+      .admin-footer { align-items: flex-start; flex-direction: column; }
+    }
+
+    @media (max-width: 480px) {
+      main { width: calc(100% - 28px); }
+      .workspace { padding: 22px 17px; }
+      .confirm-row { align-items: stretch; flex-direction: column; }
+      .admin-toolbar { grid-template-columns: 1fr; }
+      .admin-toolbar .primary { grid-column: auto; }
+      .email-status { align-items: flex-start; flex-direction: column; }
+      .session-row { grid-template-columns: 1fr; }
+      .session-row .small-button { justify-self: start; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">a</span><span>ACCOUNT DESK</span></div>
+    <span class="top-label" id="top-label">Personal account</span>
+  </header>
+  <main>
+    <div class="layout">
+      <section class="intro" aria-label="Account desk">
+        <span class="eyebrow">Account desk</span>
+        <h1>Good to have you here.</h1>
+        <p class="intro-note">Sign in to review your details, or create an account to get started.</p>
+        <div class="accent-rule" aria-hidden="true"></div>
+      </section>
+
+      <section class="workspace" aria-live="polite">
+        <div id="auth-view">
+          <div class="tabs" role="tablist" aria-label="Account access">
+            <button class="tab" type="button" role="tab" aria-selected="true" data-mode="login">Sign in</button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-mode="register">Create account</button>
+          </div>
+          <form id="auth-form">
+            <h2 id="auth-title">Welcome back</h2>
+            <p class="subheading" id="auth-subheading">Use your email and password to continue.</p>
+            <div class="field" id="name-field" hidden>
+              <label for="displayName">Name</label>
+              <input id="displayName" name="displayName" autocomplete="name" maxlength="80">
+            </div>
+            <div class="field">
+              <label for="email">Email address</label>
+              <input id="email" name="email" type="email" autocomplete="email" maxlength="254" required>
+            </div>
+            <div class="field">
+              <label for="password">Password</label>
+              <input id="password" name="password" type="password" autocomplete="current-password" minlength="10" maxlength="200" required>
+            </div>
+            <div class="form-actions"><button class="primary" id="auth-submit" type="submit">Sign in</button></div>
+            <p class="message" id="auth-message" role="status"></p>
+            <button class="inline-action" id="forgot-password" type="button">Forgot password?</button>
+          </form>
+        </div>
+
+        <div id="reset-request-view" hidden>
+          <h2>Reset your password</h2>
+          <p class="subheading">Enter your verified email address to receive a reset link.</p>
+          <form id="reset-request-form">
+            <div class="field"><label for="reset-email">Email address</label><input id="reset-email" name="email" type="email" autocomplete="email" maxlength="254" required></div>
+            <div class="form-actions"><button class="primary" type="submit">Send reset link</button><button class="secondary" id="reset-request-back" type="button">Back</button></div>
+            <p class="message" id="reset-request-message" role="status"></p>
+          </form>
+        </div>
+
+        <div id="reset-complete-view" hidden>
+          <h2>Choose a new password</h2>
+          <p class="subheading">Use at least 10 characters for your new password.</p>
+          <form id="reset-complete-form">
+            <div class="field"><label for="reset-new-password">New password</label><input id="reset-new-password" name="password" type="password" autocomplete="new-password" minlength="10" maxlength="200" required></div>
+            <div class="form-actions"><button class="primary" type="submit">Reset password</button></div>
+            <p class="message" id="reset-complete-message" role="status"></p>
+          </form>
+          <button class="secondary" id="reset-complete-back" type="button" hidden>Back to sign in</button>
+        </div>
+
+        <div id="verification-view" hidden>
+          <h2>Email verification</h2>
+          <p class="subheading" id="verification-message" role="status">Checking your verification link.</p>
+          <button class="secondary" id="verification-back" type="button">Continue to account</button>
+        </div>
+
+        <div id="account-view" hidden>
+          <div class="account-heading">
+            <div><h2>Your account</h2><p class="account-summary">Review and update your account details.</p></div>
+            <div class="form-actions" style="margin: 0">
+              <button class="secondary" id="admin-nav" type="button" hidden>Manage accounts</button>
+              <button class="secondary" id="sessions-nav" type="button">Active sessions</button>
+              <button class="secondary" id="logout" type="button">Sign out</button>
+            </div>
+          </div>
+          <form id="profile-form">
+            <div class="field">
+              <label for="profile-name">Name</label>
+              <input id="profile-name" name="displayName" autocomplete="name" maxlength="80" required>
+            </div>
+            <div class="field">
+              <label for="profile-email">Email address</label>
+              <input id="profile-email" name="email" type="email" autocomplete="email" maxlength="254" required>
+            </div>
+            <div class="form-actions"><button class="primary" type="submit">Save changes</button></div>
+            <p class="message" id="profile-message" role="status"></p>
+          </form>
+          <p class="account-meta" id="created-at"></p>
+          <div class="email-status">
+            <span id="email-status-text"></span>
+            <button class="inline-action" id="resend-verification" type="button" hidden>Send verification link</button>
+          </div>
+          <p class="message" id="verification-request-message" role="status"></p>
+          <section class="account-section">
+            <h3>Change password</h3>
+            <p class="account-section-note">Confirm your current password before choosing a new one.</p>
+            <form id="change-password-form">
+              <div class="field"><label for="current-password">Current password</label><input id="current-password" name="currentPassword" type="password" autocomplete="current-password" required></div>
+              <div class="field"><label for="new-password">New password</label><input id="new-password" name="newPassword" type="password" autocomplete="new-password" minlength="10" maxlength="200" required></div>
+              <div class="form-actions"><button class="primary" type="submit">Update password</button></div>
+              <p class="message" id="change-password-message" role="status"></p>
+            </form>
+          </section>
+          <div class="danger-zone">
+            <h3>Delete account</h3>
+            <p>This permanently removes your account and profile. Confirm with your current password.</p>
+            <form id="delete-form" class="confirm-row">
+              <div class="field">
+                <label for="delete-password">Current password</label>
+                <input id="delete-password" name="password" type="password" autocomplete="current-password" required>
+              </div>
+              <button class="danger" type="submit">Delete account</button>
+            </form>
+            <p class="message" id="delete-message" role="status"></p>
+          </div>
+        </div>
+
+        <div id="admin-view" hidden>
+          <div class="account-heading">
+            <div><h2>Account management</h2><p class="account-summary">Search accounts, update access, and manage status.</p></div>
+            <div class="form-actions" style="margin: 0">
+              <button class="secondary" id="audit-nav" type="button">Activity log</button>
+              <button class="secondary" id="admin-back" type="button">My account</button>
+            </div>
+          </div>
+          <form id="admin-search-form" class="admin-toolbar">
+            <div class="field">
+              <label for="admin-search">Search accounts</label>
+              <input id="admin-search" type="search" maxlength="100" placeholder="Name or email">
+            </div>
+            <div class="field">
+              <label for="admin-status-filter">Status</label>
+              <select id="admin-status-filter">
+                <option value="all">All accounts</option>
+                <option value="active">Active</option>
+                <option value="suspended">Suspended</option>
+              </select>
+            </div>
+            <button class="primary" type="submit">Search</button>
+          </form>
+          <div class="table-scroll">
+            <table class="account-table">
+              <thead><tr><th>Account</th><th>Created</th><th>Role</th><th>Status</th><th>Action</th></tr></thead>
+              <tbody id="admin-account-rows"></tbody>
+            </table>
+          </div>
+          <p class="message" id="admin-message" role="status"></p>
+          <div class="admin-footer">
+            <span id="admin-count">No accounts</span>
+            <div class="pagination">
+              <button class="small-button" id="admin-previous" type="button">Previous</button>
+              <button class="small-button" id="admin-next" type="button">Next</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="audit-view" hidden>
+          <div class="account-heading">
+            <div><h2>Activity log</h2><p class="account-summary">Read-only history of account and security events.</p></div>
+            <button class="secondary" id="audit-back" type="button">Manage accounts</button>
+          </div>
+          <form id="audit-search-form" class="admin-toolbar">
+            <div class="field">
+              <label for="audit-search">Search events</label>
+              <input id="audit-search" type="search" maxlength="100" placeholder="Action, email, or account ID">
+            </div>
+            <button class="primary" type="submit">Search</button>
+          </form>
+          <div class="table-scroll">
+            <table class="audit-table">
+              <thead><tr><th>Time</th><th>Actor</th><th>Event</th><th>Affected account</th><th>Details</th></tr></thead>
+              <tbody id="audit-event-rows"></tbody>
+            </table>
+          </div>
+          <p class="message" id="audit-message" role="status"></p>
+          <div class="admin-footer">
+            <span id="audit-count">No events</span>
+            <div class="pagination">
+              <button class="small-button" id="audit-previous" type="button">Previous</button>
+              <button class="small-button" id="audit-next" type="button">Next</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="sessions-view" hidden>
+          <div class="account-heading">
+            <div><h2>Active sessions</h2><p class="account-summary">Review devices signed in to your account.</p></div>
+            <button class="secondary" id="sessions-back" type="button">My account</button>
+          </div>
+          <div class="session-list" id="session-list"></div>
+          <p class="message" id="sessions-message" role="status"></p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const authView = document.querySelector('#auth-view');
+    const accountView = document.querySelector('#account-view');
+    const adminView = document.querySelector('#admin-view');
+    const auditView = document.querySelector('#audit-view');
+    const sessionsView = document.querySelector('#sessions-view');
+    const resetRequestView = document.querySelector('#reset-request-view');
+    const resetCompleteView = document.querySelector('#reset-complete-view');
+    const verificationView = document.querySelector('#verification-view');
+    const authForm = document.querySelector('#auth-form');
+    const appLayout = document.querySelector('.layout');
+    const intro = document.querySelector('.intro');
+    const topLabel = document.querySelector('#top-label');
+    const adminPage = window.location.pathname === '/admin';
+    const auditPage = window.location.pathname === '/admin/audit';
+    const actionParams = new URLSearchParams(window.location.search);
+    const verificationToken = actionParams.get('verify');
+    const resetToken = actionParams.get('reset');
+    const adminPageSize = 10;
+    let adminOffset = 0;
+    let adminTotal = 0;
+    let auditOffset = 0;
+    let auditTotal = 0;
+    let mode = 'login';
+
+    async function request(url, options = {}) {
+      const response = await fetch(url, {
+        ...options,
+        headers: { 'Content-Type': 'application/json', ...options.headers }
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Something went wrong.');
+      return result;
+    }
+
+    function setMainMode(mode, label) {
+      const workspace = mode === 'workspace';
+      appLayout.classList.toggle('workspace-layout', workspace);
+      intro.hidden = workspace;
+      topLabel.textContent = label;
+    }
+
+    function showAuth(message = '') {
+      setMainMode('auth', 'Sign in');
+      authView.hidden = false;
+      accountView.hidden = true;
+      adminView.hidden = true;
+      auditView.hidden = true;
+      sessionsView.hidden = true;
+      resetRequestView.hidden = true;
+      resetCompleteView.hidden = true;
+      verificationView.hidden = true;
+      document.querySelector('#auth-message').textContent = message;
+      document.querySelector('#password').value = '';
+    }
+
+    function showAccount(account) {
+      setMainMode('workspace', account.role === 'admin' ? 'Administrator account' : 'Personal account');
+      authView.hidden = true;
+      accountView.hidden = false;
+      adminView.hidden = true;
+      auditView.hidden = true;
+      sessionsView.hidden = true;
+      resetRequestView.hidden = true;
+      resetCompleteView.hidden = true;
+      verificationView.hidden = true;
+      document.querySelector('#admin-nav').hidden = account.role !== 'admin';
+      document.querySelector('#profile-name').value = account.displayName;
+      document.querySelector('#profile-email').value = account.pendingEmail || account.email;
+      document.querySelector('#created-at').textContent = `Account created ${new Date(account.createdAt).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}`;
+      document.querySelector('#profile-message').textContent = '';
+      document.querySelector('#delete-message').textContent = '';
+      document.querySelector('#email-status-text').textContent = account.pendingEmail
+        ? `Verification pending for ${account.pendingEmail}. Current address: ${account.email}.`
+        : account.emailVerified
+          ? `Verified email: ${account.email}`
+          : `Email not verified: ${account.email}`;
+      document.querySelector('#resend-verification').hidden = account.emailVerified && !account.pendingEmail;
+      document.querySelector('#verification-request-message').textContent = '';
+    }
+
+    function showResetRequest() {
+      setMainMode('auth', 'Account recovery');
+      authView.hidden = true;
+      accountView.hidden = true;
+      adminView.hidden = true;
+      auditView.hidden = true;
+      sessionsView.hidden = true;
+      resetRequestView.hidden = false;
+      resetCompleteView.hidden = true;
+      verificationView.hidden = true;
+    }
+
+    async function loadSessions() {
+      const message = document.querySelector('#sessions-message');
+      const list = document.querySelector('#session-list');
+      message.textContent = '';
+      try {
+        const result = await request('/api/me/sessions');
+        if (result.sessions.length === 0) {
+          const empty = document.createElement('p');
+          empty.className = 'empty-sessions';
+          empty.textContent = 'No active sessions.';
+          list.replaceChildren(empty);
+          return;
+        }
+        list.replaceChildren(...result.sessions.map(session => {
+          const row = document.createElement('div');
+          row.className = 'session-row';
+          const details = document.createElement('div');
+          const device = document.createElement('span');
+          device.className = 'session-device';
+          device.textContent = session.userAgent;
+          if (session.current) {
+            const current = document.createElement('span');
+            current.className = 'session-current';
+            current.textContent = 'THIS DEVICE';
+            device.append(current);
+          }
+          const metadata = document.createElement('span');
+          metadata.className = 'session-meta';
+          metadata.textContent = `Signed in ${new Date(session.createdAt).toLocaleString()} · Expires ${new Date(session.expiresAt).toLocaleString()}`;
+          details.append(device, metadata);
+          const revoke = document.createElement('button');
+          revoke.className = 'small-button danger';
+          revoke.type = 'button';
+          revoke.textContent = 'Revoke';
+          revoke.addEventListener('click', async () => {
+            if (!window.confirm(`Sign out ${session.current ? 'this device' : 'this session'}?`)) return;
+            try {
+              const revoked = await request(`/api/me/sessions/${session.id}`, { method: 'DELETE' });
+              if (revoked.current) return window.location.assign('/');
+              loadSessions();
+            } catch (error) {
+              message.textContent = error.message;
+            }
+          });
+          row.append(details, revoke);
+          return row;
+        }));
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
+    function showSessions() {
+      setMainMode('workspace', 'Security');
+      authView.hidden = true;
+      accountView.hidden = true;
+      adminView.hidden = true;
+      auditView.hidden = true;
+      resetRequestView.hidden = true;
+      resetCompleteView.hidden = true;
+      verificationView.hidden = true;
+      sessionsView.hidden = false;
+      loadSessions();
+    }
+
+    function showAuditLog() {
+      setMainMode('workspace', 'Administration');
+      authView.hidden = true;
+      accountView.hidden = true;
+      adminView.hidden = true;
+      auditView.hidden = false;
+      sessionsView.hidden = true;
+      resetRequestView.hidden = true;
+      resetCompleteView.hidden = true;
+      verificationView.hidden = true;
+      loadAuditEvents();
+    }
+
+    function setCellText(row, value, className = '') {
+      const cell = document.createElement('td');
+      if (className) cell.className = className;
+      cell.textContent = value;
+      row.append(cell);
+      return cell;
+    }
+
+    async function updateAdminAccount(accountId, action, value, confirmation) {
+      if (!window.confirm(confirmation)) return;
+      const message = document.querySelector('#admin-message');
+      message.textContent = '';
+      try {
+        await request(`/api/admin/accounts/${accountId}/${action}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ [action]: value })
+        });
+        await loadAdminAccounts();
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
+    function makeAccountRow(account) {
+      const row = document.createElement('tr');
+      const identity = document.createElement('td');
+      const name = document.createElement('span');
+      name.className = 'account-name';
+      name.textContent = account.displayName;
+      const email = document.createElement('span');
+      email.className = 'account-email';
+      email.textContent = account.email;
+      identity.append(name, email);
+      row.append(identity);
+      setCellText(row, new Date(account.createdAt).toLocaleDateString());
+
+      const roleCell = document.createElement('td');
+      const roleControls = document.createElement('div');
+      roleControls.className = 'role-controls';
+      const roleSelect = document.createElement('select');
+      roleSelect.setAttribute('aria-label', `Role for ${account.email}`);
+      for (const role of ['user', 'admin']) {
+        const option = document.createElement('option');
+        option.value = role;
+        option.textContent = role;
+        option.selected = role === account.role;
+        roleSelect.append(option);
+      }
+      const saveRole = document.createElement('button');
+      saveRole.className = 'small-button';
+      saveRole.type = 'button';
+      saveRole.textContent = 'Save';
+      saveRole.addEventListener('click', () => {
+        if (roleSelect.value === account.role) return;
+        updateAdminAccount(account.id, 'role', roleSelect.value, `Change ${account.displayName}'s role to ${roleSelect.value}?`);
+      });
+      roleControls.append(roleSelect, saveRole);
+      roleCell.append(roleControls);
+      row.append(roleCell);
+
+      const statusCell = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = `status-badge${account.status === 'suspended' ? ' suspended' : ''}`;
+      badge.textContent = account.status;
+      statusCell.append(badge);
+      row.append(statusCell);
+
+      const actionCell = document.createElement('td');
+      const statusButton = document.createElement('button');
+      statusButton.className = `small-button${account.status === 'active' ? ' danger' : ''}`;
+      statusButton.type = 'button';
+      statusButton.textContent = account.status === 'active' ? 'Suspend' : 'Reactivate';
+      statusButton.addEventListener('click', () => {
+        const nextStatus = account.status === 'active' ? 'suspended' : 'active';
+        const verb = nextStatus === 'suspended' ? 'Suspend' : 'Reactivate';
+        updateAdminAccount(account.id, 'status', nextStatus, `${verb} ${account.displayName}'s account?`);
+      });
+      actionCell.append(statusButton);
+      row.append(actionCell);
+      return row;
+    }
+
+    async function loadAdminAccounts() {
+      const message = document.querySelector('#admin-message');
+      message.textContent = '';
+      const params = new URLSearchParams({
+        q: document.querySelector('#admin-search').value.trim(),
+        status: document.querySelector('#admin-status-filter').value,
+        limit: String(adminPageSize),
+        offset: String(adminOffset)
+      });
+      try {
+        const result = await request(`/api/admin/accounts?${params}`);
+        adminTotal = result.total;
+        const rows = document.querySelector('#admin-account-rows');
+        rows.replaceChildren(...result.accounts.map(makeAccountRow));
+        const first = adminTotal === 0 ? 0 : adminOffset + 1;
+        const last = Math.min(adminOffset + result.accounts.length, adminTotal);
+        document.querySelector('#admin-count').textContent = `Showing ${first}-${last} of ${adminTotal}`;
+        document.querySelector('#admin-previous').disabled = adminOffset === 0;
+        document.querySelector('#admin-next').disabled = adminOffset + adminPageSize >= adminTotal;
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
+    function makeAuditRow(event) {
+      const row = document.createElement('tr');
+      setCellText(row, new Date(event.occurredAt).toLocaleString());
+      setCellText(row, event.actorEmail || (event.actorAccountId ? `Account ${event.actorAccountId}` : 'System'));
+      setCellText(row, event.action, 'audit-action');
+      setCellText(row, event.affectedEmail || (event.affectedAccountId ? `Account ${event.affectedAccountId}` : 'Unknown'));
+      const details = Object.entries(event.metadata).map(([key, value]) => {
+        const rendered = Array.isArray(value) ? value.join(', ') : String(value);
+        return `${key}: ${rendered}`;
+      }).join(' · ');
+      setCellText(row, details || '—', 'audit-metadata');
+      return row;
+    }
+
+    async function loadAuditEvents() {
+      const message = document.querySelector('#audit-message');
+      message.textContent = '';
+      const params = new URLSearchParams({
+        q: document.querySelector('#audit-search').value.trim(),
+        limit: '20',
+        offset: String(auditOffset)
+      });
+      try {
+        const result = await request(`/api/admin/audit-events?${params}`);
+        auditTotal = result.total;
+        document.querySelector('#audit-event-rows').replaceChildren(...result.events.map(makeAuditRow));
+        const first = auditTotal === 0 ? 0 : auditOffset + 1;
+        const last = Math.min(auditOffset + result.events.length, auditTotal);
+        document.querySelector('#audit-count').textContent = `Showing ${first}-${last} of ${auditTotal}`;
+        document.querySelector('#audit-previous').disabled = auditOffset === 0;
+        document.querySelector('#audit-next').disabled = auditOffset + 20 >= auditTotal;
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
+    document.querySelector('#admin-nav').addEventListener('click', () => window.location.assign('/admin'));
+    document.querySelector('#admin-back').addEventListener('click', () => window.location.assign('/'));
+    document.querySelector('#audit-nav').addEventListener('click', () => window.location.assign('/admin/audit'));
+    document.querySelector('#audit-back').addEventListener('click', () => window.location.assign('/admin'));
+    document.querySelector('#sessions-nav').addEventListener('click', () => window.location.assign('/sessions'));
+    document.querySelector('#sessions-back').addEventListener('click', () => window.location.assign('/'));
+    document.querySelector('#admin-search-form').addEventListener('submit', event => {
+      event.preventDefault();
+      adminOffset = 0;
+      loadAdminAccounts();
+    });
+    document.querySelector('#admin-status-filter').addEventListener('change', () => {
+      adminOffset = 0;
+      loadAdminAccounts();
+    });
+    document.querySelector('#admin-previous').addEventListener('click', () => {
+      adminOffset = Math.max(0, adminOffset - adminPageSize);
+      loadAdminAccounts();
+    });
+    document.querySelector('#admin-next').addEventListener('click', () => {
+      if (adminOffset + adminPageSize < adminTotal) adminOffset += adminPageSize;
+      loadAdminAccounts();
+    });
+    document.querySelector('#audit-search-form').addEventListener('submit', event => {
+      event.preventDefault();
+      auditOffset = 0;
+      loadAuditEvents();
+    });
+    document.querySelector('#audit-previous').addEventListener('click', () => {
+      auditOffset = Math.max(0, auditOffset - 20);
+      loadAuditEvents();
+    });
+    document.querySelector('#audit-next').addEventListener('click', () => {
+      if (auditOffset + 20 < auditTotal) auditOffset += 20;
+      loadAuditEvents();
+    });
+
+    document.querySelector('#forgot-password').addEventListener('click', showResetRequest);
+    document.querySelector('#reset-request-back').addEventListener('click', () => showAuth());
+    document.querySelector('#reset-request-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = document.querySelector('#reset-request-message');
+      message.textContent = '';
+      message.classList.remove('success');
+      try {
+        const values = Object.fromEntries(new FormData(event.currentTarget));
+        const result = await request('/api/password-reset/request', { method: 'POST', body: JSON.stringify(values) });
+        message.textContent = result.message;
+        message.classList.add('success');
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+
+    document.querySelector('#reset-complete-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = document.querySelector('#reset-complete-message');
+      message.textContent = '';
+      message.classList.remove('success');
+      try {
+        const values = Object.fromEntries(new FormData(event.currentTarget));
+        await request('/api/password-reset/complete', {
+          method: 'POST',
+          body: JSON.stringify({ token: resetToken, password: values.password })
+        });
+        event.currentTarget.hidden = true;
+        document.querySelector('#reset-complete-back').hidden = false;
+        message.textContent = 'Password reset. Sign in using your new password.';
+        message.classList.add('success');
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+    document.querySelector('#reset-complete-back').addEventListener('click', () => window.location.assign('/'));
+    document.querySelector('#verification-back').addEventListener('click', () => window.location.assign('/'));
+
+    document.querySelector('#resend-verification').addEventListener('click', async () => {
+      const message = document.querySelector('#verification-request-message');
+      message.textContent = '';
+      message.classList.remove('success');
+      try {
+        const result = await request('/api/me/verification-email', { method: 'POST', body: '{}' });
+        message.textContent = result.message;
+        message.classList.add('success');
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+
+    document.querySelector('#change-password-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = document.querySelector('#change-password-message');
+      message.textContent = '';
+      message.classList.remove('success');
+      try {
+        const values = Object.fromEntries(new FormData(event.currentTarget));
+        await request('/api/me/password', { method: 'POST', body: JSON.stringify(values) });
+        event.currentTarget.reset();
+        message.textContent = 'Your password has been changed. Other sessions have been signed out.';
+        message.classList.add('success');
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+
+    document.querySelectorAll('[data-mode]').forEach(tab => {
+      tab.addEventListener('click', () => {
+        mode = tab.dataset.mode;
+        document.querySelectorAll('[data-mode]').forEach(item => item.setAttribute('aria-selected', String(item === tab)));
+        const registering = mode === 'register';
+        document.querySelector('#name-field').hidden = !registering;
+        document.querySelector('#displayName').required = registering;
+        document.querySelector('#password').autocomplete = registering ? 'new-password' : 'current-password';
+        document.querySelector('#auth-title').textContent = registering ? 'Create your account' : 'Welcome back';
+        document.querySelector('#auth-subheading').textContent = registering ? 'A few details and you are all set.' : 'Use your email and password to continue.';
+        document.querySelector('#auth-submit').textContent = registering ? 'Create account' : 'Sign in';
+        document.querySelector('#auth-message').textContent = '';
+      });
+    });
+
+    authForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = document.querySelector('#auth-message');
+      message.textContent = '';
+      const values = Object.fromEntries(new FormData(authForm));
+      try {
+        const result = await request(`/api/${mode}`, { method: 'POST', body: JSON.stringify(values) });
+        authForm.reset();
+        showAccount(result.account);
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+
+    document.querySelector('#profile-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = document.querySelector('#profile-message');
+      message.textContent = '';
+      message.classList.remove('success');
+      try {
+        const result = await request('/api/me', {
+          method: 'PATCH',
+          body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))
+        });
+        showAccount(result.account);
+        const success = document.querySelector('#profile-message');
+        success.textContent = 'Your changes have been saved.';
+        success.classList.add('success');
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+
+    document.querySelector('#logout').addEventListener('click', async () => {
+      await request('/api/logout', { method: 'POST', body: '{}' });
+      showAuth();
+    });
+
+    document.querySelector('#delete-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = document.querySelector('#delete-message');
+      message.textContent = '';
+      if (!window.confirm('Delete your account permanently? This cannot be undone.')) return;
+      try {
+        await request('/api/me', {
+          method: 'DELETE',
+          body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))
+        });
+        showAuth('Your account has been deleted.');
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+
+    if (verificationToken) {
+      setMainMode('auth', 'Email verification');
+      authView.hidden = true;
+      accountView.hidden = true;
+      adminView.hidden = true;
+      verificationView.hidden = false;
+      window.history.replaceState(null, '', '/');
+      request('/api/email/verify', { method: 'POST', body: JSON.stringify({ token: verificationToken }) })
+        .then(() => { document.querySelector('#verification-message').textContent = 'Your email address is verified.'; })
+        .catch(error => { document.querySelector('#verification-message').textContent = error.message; });
+    } else if (resetToken) {
+      setMainMode('auth', 'Password recovery');
+      authView.hidden = true;
+      accountView.hidden = true;
+      adminView.hidden = true;
+      resetCompleteView.hidden = false;
+      window.history.replaceState(null, '', '/');
+    } else {
+      request('/api/me')
+        .then(result => {
+          if (adminPage) {
+            if (result.account.role !== 'admin') return window.location.replace('/');
+            setMainMode('workspace', 'Administration');
+            authView.hidden = true;
+            accountView.hidden = true;
+            adminView.hidden = false;
+            loadAdminAccounts();
+            return;
+          }
+          if (auditPage) {
+            if (result.account.role !== 'admin') return window.location.replace('/');
+            return showAuditLog();
+          }
+          if (window.location.pathname === '/sessions') return showSessions();
+          showAccount(result.account);
+        })
+        .catch(() => {
+          if (adminPage || auditPage || window.location.pathname === '/sessions') window.location.replace('/');
+          else showAuth();
+        });
+    }
+  </script>
+</body>
+</html>

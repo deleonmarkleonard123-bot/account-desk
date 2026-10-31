@@ -1,0 +1,20 @@
+{
+  "name": "mlad-node-account-desk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small Node.js account management app",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "promote-admin": "node server.js promote-admin",
+    "db:backup": "node db-tools.js backup",
+    "db:restore": "node db-tools.js restore",
+    "test": "node --test account-roles.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "nodemailer": "^10.3.0"
+  }
+}

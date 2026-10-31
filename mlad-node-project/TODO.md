@@ -1,0 +1,3 @@
+#connect to supabase
+project url - https://cjijxelrgmwhyahqyvom.supabase.co
+anon key - eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNqaWp4ZWxyZ213aHlhaHF5dm9tIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMyNzI0ODQsImV4cCI6MjEwODg0ODQ4NH0.61FYZfw1O5qfm_3ZL1n-jeVujVgrSKEGSuTxi3T1mNo

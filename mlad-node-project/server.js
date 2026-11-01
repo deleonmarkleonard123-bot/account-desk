@@ -1,5 +1,5 @@
 const http = require('node:http');
-const { createHash, randomBytes, scrypt: scryptCallback, timingSafeEqual } = require('node:crypto');
+const { createHash, createHmac, randomBytes, scrypt: scryptCallback, timingSafeEqual } = require('node:crypto');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { DatabaseSync } = require('node:sqlite');
 const { Pool } = require('pg');
@@ -99,6 +99,14 @@ function buildQueries() {
 	return {
 		findById: prepareQuery('SELECT * FROM accounts WHERE id = ?'),
 		findByEmail: prepareQuery('SELECT * FROM accounts WHERE lower(email) = lower(?)'),
+		findMfaSecret: prepareQuery('SELECT * FROM mfa_secrets WHERE account_id = ?'),
+		insertMfaSecret: prepareQuery(`
+			INSERT INTO mfa_secrets (account_id, secret, enabled, created_at)
+			VALUES (?, ?, ?, ?)
+		`),
+		updateMfaSecret: prepareQuery('UPDATE mfa_secrets SET secret = ?, created_at = ? WHERE account_id = ?'),
+		enableMfaSecret: prepareQuery('UPDATE mfa_secrets SET enabled = TRUE WHERE account_id = ?'),
+		deleteMfaSecret: prepareQuery('DELETE FROM mfa_secrets WHERE account_id = ?'),
 		insert: prepareQuery(`
 			INSERT INTO accounts (id, email, display_name, created_at, role, status, salt, password_hash)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -392,6 +400,78 @@ function validatePassword(password) {
 
 function hashToken(token) {
 	return createHash('sha256').update(token).digest('hex');
+}
+
+function base32Encode(buffer) {
+	const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+	let bits = 0;
+	let value = 0;
+	let output = '';
+	for (const byte of buffer) {
+		value = (value << 8) | byte;
+		bits += 8;
+		while (bits >= 5) {
+			output += alphabet[(value >>> (bits - 5)) & 31];
+			bits -= 5;
+		}
+	}
+	if (bits > 0) {
+		output += alphabet[(value << (5 - bits)) & 31];
+	}
+	return output;
+}
+
+function base32Decode(secret) {
+	const normalized = secret.replace(/\s+/g, '').toUpperCase();
+	let bits = '';
+	for (const character of normalized) {
+		const index = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'.indexOf(character);
+		if (index === -1) throw new Error('Invalid MFA secret.');
+		bits += index.toString(2).padStart(5, '0');
+	}
+	const chunks = [];
+	for (let index = 0; index + 8 <= bits.length; index += 8) {
+		chunks.push(parseInt(bits.slice(index, index + 8), 2));
+	}
+	return Buffer.from(chunks);
+}
+
+function generateTotpSecret() {
+	return base32Encode(randomBytes(20));
+}
+
+function totpCode(secret, time = Date.now()) {
+	const key = base32Decode(secret);
+	const counter = Math.floor(time / 30000);
+	const buffer = Buffer.alloc(8);
+	let value = counter;
+	for (let index = 7; index >= 0; index -= 1) {
+		buffer[index] = value & 0xff;
+		value = Math.floor(value / 256);
+	}
+	const digest = createHmac('sha1', key).update(buffer).digest();
+	const offset = digest[digest.length - 1] & 0x0f;
+	const binary = ((digest[offset] & 0x7f) << 24)
+		| ((digest[offset + 1] & 0xff) << 16)
+		| ((digest[offset + 2] & 0xff) << 8)
+		| (digest[offset + 3] & 0xff);
+	return String(binary % 1000000).padStart(6, '0');
+}
+
+function verifyTotpCode(secret, code) {
+	if (typeof code !== 'string') return false;
+	const trimmedCode = code.trim();
+	if (!/^\d{6}$/.test(trimmedCode)) return false;
+	const window = [0, -1, 1];
+	for (const offset of window) {
+		if (totpCode(secret, Date.now() + offset * 30000) === trimmedCode) return true;
+	}
+	return false;
+}
+
+function totpOtpauthUri(email, secret) {
+	const label = encodeURIComponent(`Account Desk:${email}`);
+	return `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent('Account Desk')}`;
 }
 
 async function createAccountToken(accountId, purpose, email, lifetime) {
@@ -709,6 +789,13 @@ async function handleApi(request, response, url) {
 			throw createError(401, 'Email or password is incorrect.');
 		}
 
+		if (account.role === 'admin') {
+			const mfaSecret = await queries.findMfaSecret.get(account.id);
+			if (mfaSecret && mfaSecret.enabled) {
+				if (typeof body.code !== 'string') throw createError(401, 'Multi-factor authentication code is required.');
+				if (!verifyTotpCode(mfaSecret.secret, body.code)) throw createError(401, 'Invalid or expired multi-factor authentication code.');
+			}
+		}
 		await recordAuditEvent(account, 'sign_in.succeeded');
 		return sendJson(response, 200, { account: publicAccount(account) }, {
 			'Set-Cookie': await sessionCookieForRequest(request, account.id)
@@ -823,6 +910,43 @@ async function handleApi(request, response, url) {
 		});
 	}
 
+	if (request.method === 'POST' && url.pathname === '/api/me/mfa/setup') {
+		if (account.role !== 'admin') throw createError(403, 'Administrator access is required.');
+		const existing = await queries.findMfaSecret.get(account.id);
+		if (existing && existing.enabled) throw createError(409, 'MFA is already enabled for this account.');
+		const secret = generateTotpSecret();
+		if (existing) await queries.updateMfaSecret.run(secret, new Date().toISOString(), account.id);
+		else await queries.insertMfaSecret.run(account.id, secret, false, new Date().toISOString());
+		return sendJson(response, 200, {
+			secret,
+			otpauthUri: totpOtpauthUri(account.email, secret),
+			enabled: false
+		});
+	}
+
+	if (request.method === 'POST' && url.pathname === '/api/me/mfa/enable') {
+		if (account.role !== 'admin') throw createError(403, 'Administrator access is required.');
+		const body = await readBody(request);
+		const record = await queries.findMfaSecret.get(account.id);
+		if (!record) throw createError(404, 'Set up MFA before enabling it.');
+		if (record.enabled) throw createError(409, 'MFA is already enabled for this account.');
+		if (!verifyTotpCode(record.secret, body.code)) throw createError(401, 'Invalid or expired multi-factor authentication code.');
+		await queries.enableMfaSecret.run(account.id);
+		await recordAuditEvent(account, 'mfa.enabled');
+		return sendJson(response, 200, { enabled: true });
+	}
+
+	if (request.method === 'DELETE' && url.pathname === '/api/me/mfa') {
+		if (account.role !== 'admin') throw createError(403, 'Administrator access is required.');
+		const body = await readBody(request);
+		const record = await queries.findMfaSecret.get(account.id);
+		if (!record || !record.enabled) throw createError(404, 'MFA is not enabled for this account.');
+		if (!verifyTotpCode(record.secret, body.code)) throw createError(401, 'Invalid or expired multi-factor authentication code.');
+		await queries.deleteMfaSecret.run(account.id);
+		await recordAuditEvent(account, 'mfa.disabled');
+		return sendJson(response, 200, { disabled: true });
+	}
+
 	if (request.method === 'DELETE' && url.pathname === '/api/me') {
 		const body = await readBody(request);
 		if (typeof body.password !== 'string' || !(await passwordMatches(body.password, account))) {
@@ -913,6 +1037,12 @@ async function initializeDatabase() {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS rate_limits_expiry ON rate_limits (expires_at);
+			CREATE TABLE IF NOT EXISTS mfa_secrets (
+				account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+				secret TEXT NOT NULL,
+				enabled INTEGER NOT NULL DEFAULT 0,
+				created_at TEXT NOT NULL
+			);
 		`);
 			const accountColumns = database.prepare('PRAGMA table_info(accounts)').all();
 			if (!accountColumns.some(column => column.name === 'role')) {

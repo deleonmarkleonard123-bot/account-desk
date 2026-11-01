@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS rate_limits (
 );
 CREATE INDEX IF NOT EXISTS rate_limits_expiry ON rate_limits (expires_at);
 
+CREATE TABLE IF NOT EXISTS mfa_secrets (
+    account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    secret TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TEXT NOT NULL
+);
+
 ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE account_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;

@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const fs = require('node:fs/promises');
-const { createHash } = require('node:crypto');
+const { createHash, createHmac } = require('node:crypto');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
@@ -89,6 +89,35 @@ function latestEmailToken(purpose, email) {
 	const token = decodedMessage.match(new RegExp(`${purpose === 'verify_email' ? 'verify' : 'reset'}=([A-Za-z0-9_-]+)`))?.[1];
 	assert.ok(token, `Expected a token link in the ${purpose} email`);
 	return token;
+}
+
+function totpCode(secret, time = Date.now()) {
+	const base32Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+	const normalized = secret.replace(/\s+/g, '').toUpperCase();
+	const bytes = [];
+	let bits = 0;
+	let bitCount = 0;
+	for (const character of normalized) {
+		const value = base32Chars.indexOf(character);
+		assert.notEqual(value, -1, 'Invalid base32 secret');
+		bits = (bits << 5) | value;
+		bitCount += 5;
+		while (bitCount >= 8) {
+			bitCount -= 8;
+			bytes.push((bits >> bitCount) & 0xff);
+		}
+	}
+	const counter = Math.floor(time / 30000);
+	const buffer = Buffer.alloc(8);
+	let value = counter;
+	for (let index = 7; index >= 0; index -= 1) {
+		buffer[index] = value & 0xff;
+		value = Math.floor(value / 256);
+	}
+	const digest = createHmac('sha1', Buffer.from(bytes)).update(buffer).digest();
+	const offset = digest[digest.length - 1] & 0x0f;
+	const binary = ((digest[offset] & 0x7f) << 24) | ((digest[offset + 1] & 0xff) << 16) | ((digest[offset + 2] & 0xff) << 8) | (digest[offset + 3] & 0xff);
+	return String(binary % 1000000).padStart(6, '0');
 }
 
 function runPromotion(email) {
@@ -439,6 +468,105 @@ test('audit events support filters and CSV export for admins', async () => {
 			await once(auditServer, 'exit');
 		}
 		await fs.rm(auditDirectory, { recursive: true, force: true });
+	}
+});
+
+test('admin multi-factor authentication enforces validation at login', async () => {
+	const mfaDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'account-mfa-'));
+	const mfaDatabaseFile = path.join(mfaDirectory, 'mfa.sqlite');
+	const mfaPort = await getFreePort();
+	const mfaUrl = `http://127.0.0.1:${mfaPort}`;
+	const mfaServer = spawn(process.execPath, [serverFile], {
+		stdio: 'ignore',
+		env: {
+			...process.env,
+			HOST: '127.0.0.1',
+			PORT: String(mfaPort),
+			APP_BASE_URL: 'https://accounts.example.test',
+			DB_PATH: mfaDatabaseFile,
+			DB_BACKEND: 'sqlite',
+			NODE_ENV: 'test',
+			SMTP_HOST: '127.0.0.1',
+			SMTP_PORT: String(smtpPort),
+			MAIL_FROM: 'Account Desk <no-reply@example.test>',
+			TRUST_PROXY: 'true'
+		}
+	});
+
+	try {
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			if (mfaServer.exitCode !== null) throw new Error('MFA test server exited before becoming ready.');
+			try {
+				const response = await fetch(`${mfaUrl}/api/me`);
+				if (response.status === 401) break;
+			} catch {}
+			await new Promise(resolve => setTimeout(resolve, 50));
+		}
+
+		let response = await fetch(`${mfaUrl}/api/register`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				displayName: 'MFA Admin',
+				email: 'mfa-admin@example.com',
+				password: 'mfa-admin-password'
+			})
+		});
+		assert.equal(response.status, 201);
+		const cookie = response.headers.get('set-cookie').split(';')[0];
+		const promotion = spawnSync(process.execPath, [serverFile, 'promote-admin', 'mfa-admin@example.com'], {
+			encoding: 'utf8',
+			env: { ...process.env, DB_BACKEND: 'sqlite', DB_PATH: mfaDatabaseFile }
+		});
+		assert.equal(promotion.status, 0, promotion.stderr || promotion.stdout);
+
+		response = await fetch(`${mfaUrl}/api/me/mfa/setup`, {
+			method: 'POST',
+			headers: { Cookie: cookie }
+		});
+		assert.equal(response.status, 200);
+		const setup = await response.json();
+		assert.ok(setup.secret);
+		assert.match(setup.otpauthUri, /^otpauth:\/\/totp\//);
+		const code = totpCode(setup.secret);
+
+		response = await fetch(`${mfaUrl}/api/me/mfa/enable`, {
+			method: 'POST',
+			headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ code })
+		});
+		assert.equal(response.status, 200);
+		assert.equal((await response.json()).enabled, true);
+
+		response = await fetch(`${mfaUrl}/api/login`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ email: 'mfa-admin@example.com', password: 'mfa-admin-password' })
+		});
+		assert.equal(response.status, 401);
+		assert.match(JSON.stringify(await response.json()), /Multi-factor authentication/);
+
+		response = await fetch(`${mfaUrl}/api/login`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ email: 'mfa-admin@example.com', password: 'mfa-admin-password', code })
+		});
+		assert.equal(response.status, 200);
+		const adminCookie = response.headers.get('set-cookie').split(';')[0];
+
+		response = await fetch(`${mfaUrl}/api/me/mfa`, {
+			method: 'DELETE',
+			headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ code })
+		});
+		assert.equal(response.status, 200);
+		assert.equal((await response.json()).disabled, true);
+	} finally {
+		if (mfaServer.exitCode === null) {
+			mfaServer.kill('SIGTERM');
+			await once(mfaServer, 'exit');
+		}
+		await fs.rm(mfaDirectory, { recursive: true, force: true });
 	}
 });
 

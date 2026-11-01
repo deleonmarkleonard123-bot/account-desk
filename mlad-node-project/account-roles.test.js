@@ -739,6 +739,21 @@ test('email verification and password management enforce one-time token rules', 
 	const database = new DatabaseSync(databaseFile);
 	assert.ok(database.prepare('SELECT token_hash FROM account_tokens WHERE token_hash = ?')
 		.get(createHash('sha256').update(token).digest('hex')));
+	response = await fetch(`${baseUrl}/api/me/verification-email`, {
+		method: 'POST',
+		headers: { Cookie: sessionCookie }
+	});
+	assert.equal(response.status, 200);
+	assert.match((await response.json()).message, /recovery@example\.com/);
+	const originalToken = token;
+	token = latestEmailToken('verify_email', 'recovery@example.com');
+	assert.notEqual(token, originalToken);
+	response = await fetch(`${baseUrl}/api/email/verify`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ token: originalToken })
+	});
+	assert.equal(response.status, 400);
 
 	response = await fetch(`${baseUrl}/api/email/verify`, {
 		method: 'POST',

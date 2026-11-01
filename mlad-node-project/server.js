@@ -623,7 +623,12 @@ async function sendAccountEmail(purpose, email, token) {
 			return;
 		} catch (error) {
 			appHealthState.recentEmailFailures += 1;
-			throw error;
+			console.error('Account email delivery failed:', {
+				code: error.code,
+				responseCode: error.responseCode,
+				command: error.command
+			});
+			throw createError(503, 'Email delivery failed. Check the SMTP settings and try again.');
 		}
 	}
 

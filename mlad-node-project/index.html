@@ -318,6 +318,18 @@
               <tbody id="admin-account-rows"></tbody>
             </table>
           </div>
+          <div class="detail-panel" id="admin-status-panel" hidden>
+            <div class="account-heading">
+              <div><h3>System status</h3><p class="account-summary">Database, email, and backup checks.</p></div>
+            </div>
+            <div class="detail-grid">
+              <div class="detail-field"><strong>Overall</strong><span id="status-overall">—</span></div>
+              <div class="detail-field"><strong>Database</strong><span id="status-database">—</span></div>
+              <div class="detail-field"><strong>Email</strong><span id="status-email">—</span></div>
+              <div class="detail-field"><strong>Backup</strong><span id="status-backup">—</span></div>
+              <div class="detail-field"><strong>Checked</strong><span id="status-timestamp">—</span></div>
+            </div>
+          </div>
           <div class="detail-panel" id="admin-detail-panel" hidden>
             <div class="account-heading">
               <div><h3>Account details</h3><p class="account-summary" id="detail-summary">Select an account to inspect recent activity.</p></div>
@@ -712,6 +724,21 @@
       return row;
     }
 
+    async function loadOperationalStatus() {
+      try {
+        const result = await request('/api/admin/status');
+        const panel = document.querySelector('#admin-status-panel');
+        panel.hidden = false;
+        document.querySelector('#status-overall').textContent = result.overall;
+        document.querySelector('#status-database').textContent = `${result.database.status} · ${result.database.backend}`;
+        document.querySelector('#status-email').textContent = `${result.email.status} · ${result.email.configured ? 'configured' : 'not configured'}`;
+        document.querySelector('#status-backup').textContent = `${result.backup.status} · ${result.backup.backend}`;
+        document.querySelector('#status-timestamp').textContent = new Date(result.checkedAt).toLocaleString();
+      } catch (error) {
+        document.querySelector('#admin-message').textContent = error.message;
+      }
+    }
+
     async function loadAdminAccounts() {
       const message = document.querySelector('#admin-message');
       message.textContent = '';
@@ -731,6 +758,7 @@
         document.querySelector('#admin-count').textContent = `Showing ${first}-${last} of ${adminTotal}`;
         document.querySelector('#admin-previous').disabled = adminOffset === 0;
         document.querySelector('#admin-next').disabled = adminOffset + adminPageSize >= adminTotal;
+        await loadOperationalStatus();
       } catch (error) {
         message.textContent = error.message;
       }

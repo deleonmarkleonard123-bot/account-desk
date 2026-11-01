@@ -70,7 +70,7 @@ Give administrators the context needed to resolve account and security issues in
 ## 4. Operational Status Panel
 
 ### Goal
-Make service and email-delivery problems visible before they disrupt account workflows.
+Make service and email-delivery problems visible before they disrupt account workflows. 
 
 ### Requirements
 - Show database connectivity and a recent successful application health check.

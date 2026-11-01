@@ -616,6 +616,37 @@ test('admin detail endpoint exposes account context and recent activity', async 
 	assert.equal(response.status, 403);
 });
 
+test('admin operational status panel exposes health without leaking secrets', async () => {
+	let response = await fetch(`${baseUrl}/api/admin/status`, { headers: { Cookie: 'session=not-a-valid-session' } });
+	assert.equal(response.status, 401);
+
+	response = await fetch(`${baseUrl}/api/login`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ email: 'regular@example.com', password: 'regular-account-password' })
+	});
+	assert.equal(response.status, 200);
+	const adminCookie = response.headers.get('set-cookie').split(';')[0];
+
+	response = await fetch(`${baseUrl}/api/admin/status`, { headers: { Cookie: adminCookie } });
+	assert.equal(response.status, 200);
+	const status = await response.json();
+	assert.ok(status.checkedAt);
+	assert.ok(['healthy', 'degraded', 'unavailable'].includes(status.overall));
+	assert.ok(status.database && typeof status.database.status === 'string');
+	assert.ok(status.email && typeof status.email.status === 'string');
+	assert.ok(status.backup && typeof status.backup.status === 'string');
+	assert.equal(typeof status.database.backend, 'string');
+	assert.equal(typeof status.email.configured, 'boolean');
+	assert.equal(typeof status.backup.backend, 'string');
+	assert.doesNotMatch(JSON.stringify(status), /DATABASE_URL|SMTP_PASS|smtp_pass|password/i);
+
+	response = await fetch(`${baseUrl}/api/admin/status`, {
+		headers: { Cookie: 'session=not-a-valid-session' }
+	});
+	assert.equal(response.status, 401);
+});
+
 test('email verification and password management enforce one-time token rules', async () => {
 	let response = await fetch(`${baseUrl}/api/register`, {
 		method: 'POST',

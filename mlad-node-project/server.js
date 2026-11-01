@@ -279,6 +279,99 @@ function publicAccount(account) {
 	};
 }
 
+const appHealthState = { recentEmailFailures: 0, lastHealthCheckAt: null };
+
+async function checkDatabaseHealth() {
+	const backend = usePostgresBackend() ? 'postgres' : 'sqlite';
+	const checkedAt = new Date().toISOString();
+	try {
+		if (backend === 'postgres') {
+			await postgresPool.query('SELECT 1');
+		} else {
+			const probe = new DatabaseSync(databaseFile, { readOnly: true });
+			try {
+				const result = probe.prepare('PRAGMA integrity_check').get();
+				if (result.integrity_check !== 'ok') throw new Error('SQLite integrity check failed.');
+				await queries.count.get();
+			} finally {
+				probe.close();
+			}
+		}
+		return {
+			backend,
+			status: 'healthy',
+			checkedAt,
+			summary: backend === 'postgres'
+				? 'The database is reachable and responding to health checks.'
+				: 'The SQLite database passed integrity checks and is readable.'
+		};
+	} catch (error) {
+		return {
+			backend,
+			status: 'unavailable',
+			checkedAt,
+			summary: 'The database is currently unavailable or failed its integrity check.'
+		};
+	}
+}
+
+function checkEmailHealth() {
+	const configured = Boolean(process.env.SMTP_HOST && process.env.MAIL_FROM);
+	let status = configured ? 'healthy' : 'degraded';
+	if (!configured && process.env.NODE_ENV === 'production') status = 'unavailable';
+	if (appHealthState.recentEmailFailures > 0) status = 'degraded';
+	return {
+		configured,
+		status,
+		recentDeliveryFailures: appHealthState.recentEmailFailures,
+		summary: configured
+			? (appHealthState.recentEmailFailures > 0 ? 'Email delivery is configured, but recent sends have failed.' : 'Email delivery is configured and ready to send account notifications.')
+			: 'Email delivery is not configured, so account notifications may fail.'
+	};
+}
+
+async function checkBackupHealth() {
+	const backend = usePostgresBackend() ? 'postgres' : 'sqlite';
+	if (backend === 'postgres') {
+		return {
+			backend,
+			status: 'healthy',
+			summary: 'Backup and recovery are managed by the database platform and are not exposed here.'
+		};
+	}
+	try {
+		await fs.access(databaseFile);
+		return {
+			backend,
+			status: 'healthy',
+			summary: 'SQLite data is present; use the backup tooling to create a verified copy.'
+		};
+	} catch {
+		return {
+			backend,
+			status: 'degraded',
+			summary: 'The SQLite database file is not available, so backup verification may be incomplete.'
+		};
+	}
+}
+
+async function getOperationalStatus() {
+	const database = await checkDatabaseHealth();
+	const email = checkEmailHealth();
+	const backup = await checkBackupHealth();
+	appHealthState.lastHealthCheckAt = new Date().toISOString();
+	const overall = [database.status, email.status, backup.status].some(status => status === 'unavailable')
+		? 'unavailable'
+		: ([database.status, email.status, backup.status].some(status => status === 'degraded') ? 'degraded' : 'healthy');
+	return {
+		checkedAt: appHealthState.lastHealthCheckAt,
+		overall,
+		database,
+		email,
+		backup
+	};
+}
+
 function accountFromRow(row) {
 	if (!row) return null;
 	return {
@@ -516,8 +609,14 @@ async function sendAccountEmail(purpose, email, token) {
 				auth
 			});
 		}
-		await mailTransport.sendMail({ from: process.env.MAIL_FROM, to: email, subject, text });
-		return;
+		try {
+			await mailTransport.sendMail({ from: process.env.MAIL_FROM, to: email, subject, text });
+			appHealthState.recentEmailFailures = 0;
+			return;
+		} catch (error) {
+			appHealthState.recentEmailFailures += 1;
+			throw error;
+		}
 	}
 
 	if (process.env.NODE_ENV === 'production') {
@@ -671,6 +770,13 @@ async function handleApi(request, response, url) {
 		const body = await readBody(request);
 		await resetPasswordWithToken(body.token, body.password);
 		return sendJson(response, 200, { message: 'Your password has been reset. Sign in with your new password.' });
+	}
+
+	if (request.method === 'GET' && url.pathname === '/api/admin/status') {
+		const administrator = await getAccountForRequest(request);
+		if (!administrator) throw createError(401, 'Please sign in to continue.');
+		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
+		return sendJson(response, 200, await getOperationalStatus());
 	}
 
 	if (url.pathname.startsWith('/api/admin/accounts')) {

@@ -7,6 +7,7 @@ const { promisify } = require('node:util');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const nodemailer = require('nodemailer');
+const { createSupabaseAuth, SupabaseAuthError } = require('./supabase-auth');
 require('dotenv').config();
 
 const scrypt = promisify(scryptCallback);
@@ -21,6 +22,12 @@ const verificationLifetime = 24 * 60 * 60 * 1000;
 const resetLifetime = 15 * 60 * 1000;
 const inviteLifetime = 3 * 24 * 60 * 60 * 1000;
 const rateLimitWindowMs = positiveIntegerSetting('RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000);
+const authBackend = process.env.AUTH_BACKEND || 'legacy';
+const supabaseAuth = createSupabaseAuth({
+	url: process.env.SUPABASE_URL,
+	anonKey: process.env.SUPABASE_ANON_KEY,
+	serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY
+});
 let database;
 let postgresPool;
 let queries;
@@ -102,6 +109,7 @@ function buildQueries() {
 		findByEmail: prepareQuery('SELECT * FROM accounts WHERE lower(email) = lower(?)'),
 		findActiveInvitationByEmail: prepareQuery('SELECT * FROM account_tokens WHERE purpose = ? AND lower(email) = lower(?) AND used_at IS NULL AND expires_at > ? ORDER BY expires_at DESC LIMIT 1'),
 		deleteInvitationByEmail: prepareQuery("UPDATE account_tokens SET expires_at = ? WHERE purpose = 'invite' AND lower(email) = lower(?) AND used_at IS NULL"),
+		markInvitationUsed: prepareQuery("UPDATE account_tokens SET used_at = ? WHERE account_id = ? AND purpose = 'invite' AND lower(email) = lower(?) AND used_at IS NULL"),
 		findMfaSecret: prepareQuery('SELECT * FROM mfa_secrets WHERE account_id = ?'),
 		insertMfaSecret: prepareQuery(`
 			INSERT INTO mfa_secrets (account_id, secret, enabled, created_at)
@@ -121,6 +129,8 @@ function buildQueries() {
 		updateRole: prepareQuery('UPDATE accounts SET role = ? WHERE id = ?'),
 		updateStatus: prepareQuery('UPDATE accounts SET status = ? WHERE id = ?'),
 		delete: prepareQuery('DELETE FROM accounts WHERE id = ?'),
+		listAllAccounts: prepareQuery('SELECT * FROM accounts ORDER BY created_at, id'),
+		clearLegacyCredentials: prepareQuery("UPDATE accounts SET salt = '', password_hash = '' WHERE id = ?"),
 		count: prepareQuery('SELECT COUNT(*) AS count FROM accounts'),
 		adminCount: prepareQuery("SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin'"),
 		activeAdminCount: prepareQuery("SELECT COUNT(*) AS count FROM accounts WHERE role = 'admin' AND status = 'active'"),
@@ -170,6 +180,7 @@ function buildQueries() {
 			VALUES (?, ?, ?, ?, ?, NULL)
 		`),
 		deleteAccountTokensByPurpose: prepareQuery('DELETE FROM account_tokens WHERE account_id = ? AND purpose = ? AND used_at IS NULL'),
+		deleteLegacyAuthTokens: prepareQuery("DELETE FROM account_tokens WHERE account_id = ? AND purpose IN ('verify_email', 'password_reset')"),
 		markTokenUsed: prepareQuery('UPDATE account_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL'),
 		invalidateAccountTokens: prepareQuery('DELETE FROM account_tokens WHERE account_id = ? AND used_at IS NULL'),
 		countAccounts: prepareQuery(`
@@ -214,6 +225,16 @@ async function withTransaction(callback) {
 }
 
 function sendJson(response, status, value, headers = {}) {
+	const existingCookies = response.getHeader('Set-Cookie');
+	if (existingCookies && headers['Set-Cookie']) {
+		headers = {
+			...headers,
+			'Set-Cookie': [
+				...(Array.isArray(existingCookies) ? existingCookies : [existingCookies]),
+				...(Array.isArray(headers['Set-Cookie']) ? headers['Set-Cookie'] : [headers['Set-Cookie']])
+			]
+		};
+	}
 	response.writeHead(status, {
 		'Content-Type': 'application/json; charset=utf-8',
 		'Cache-Control': 'no-store',
@@ -319,6 +340,17 @@ async function checkDatabaseHealth() {
 }
 
 function checkEmailHealth() {
+	if (authBackend === 'supabase') {
+		const configured = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY && process.env.SUPABASE_SERVICE_ROLE_KEY);
+		return {
+			configured,
+			status: configured ? 'healthy' : 'unavailable',
+			recentDeliveryFailures: appHealthState.recentEmailFailures,
+			summary: configured
+				? 'Email delivery is managed by Supabase Auth; check SMTP provider delivery health in Supabase.'
+				: 'Supabase Auth email delivery is not configured for this application.'
+		};
+	}
 	const configured = Boolean(process.env.SMTP_HOST && process.env.MAIL_FROM);
 	let status = configured ? 'healthy' : 'degraded';
 	if (!configured && process.env.NODE_ENV === 'production') status = 'unavailable';
@@ -403,11 +435,57 @@ function sessionCookie(value, maxAge, secure = false) {
 	return `session=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secureAttribute}`;
 }
 
+function authCookie(name, value, maxAge, secure = false) {
+	const secureAttribute = secure ? '; Secure' : '';
+	return `${name}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secureAttribute}`;
+}
+
+function getCookie(request, name) {
+	const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return (request.headers.cookie || '').match(new RegExp(`(?:^|;\\s*)${escapedName}=([^;]*)`))?.[1] || null;
+}
+
+function setResponseCookies(response, cookies) {
+	const existing = response.getHeader('Set-Cookie');
+	response.setHeader('Set-Cookie', [...(Array.isArray(existing) ? existing : existing ? [existing] : []), ...cookies]);
+}
+
 function clearSessionCookie(request) {
 	return sessionCookie('', 0, isSecureRequest(request));
 }
 
-async function getAccountForRequest(request) {
+async function getAccountForRequest(request, response) {
+	if (authBackend === 'supabase') {
+		const sessionToken = getCookie(request, 'session');
+		if (!sessionToken) return null;
+		const localSession = await queries.findSessionByToken.get(hashToken(sessionToken));
+		if (!localSession || localSession.expires_at <= Date.now()) {
+			if (localSession) await queries.deleteSessionByToken.run(hashToken(sessionToken));
+			return null;
+		}
+
+		let authUser;
+		const accessToken = getCookie(request, 'sb-access-token');
+		const refreshToken = getCookie(request, 'sb-refresh-token');
+		try {
+			if (accessToken) authUser = await supabaseAuth.getUser(accessToken);
+		} catch {}
+		if (!authUser && refreshToken) {
+			try {
+				const refreshed = await supabaseAuth.refreshSession(refreshToken);
+				authUser = refreshed.user;
+				setResponseCookies(response, [
+					authCookie('sb-access-token', refreshed.access_token, Math.min(refreshed.expires_in || 3600, Math.floor(sessionLifetime / 1000)), isSecureRequest(request)),
+					authCookie('sb-refresh-token', refreshed.refresh_token, Math.floor(sessionLifetime / 1000), isSecureRequest(request))
+				]);
+			} catch {}
+		}
+		const accountId = authUser?.app_metadata?.account_id;
+		const account = accountId ? accountFromRow(await queries.findById.get(accountId)) : null;
+		if (account) account.authUserId = authUser.id;
+		return account?.status === 'active' ? account : null;
+	}
+
 	const cookie = request.headers.cookie || '';
 	const token = cookie.match(/(?:^|;\s*)session=([a-f0-9]+)/)?.[1];
 	if (!token) return null;
@@ -440,6 +518,28 @@ async function sessionCookieForRequest(request, accountId) {
 		Math.floor(sessionLifetime / 1000),
 		isSecureRequest(request)
 	);
+}
+
+async function supabaseSessionCookies(request, accountId, authSession) {
+	const token = randomBytes(32).toString('hex');
+	const now = Date.now();
+	const maxAge = Math.floor(sessionLifetime / 1000);
+	await queries.insertSession.run(randomBytes(16).toString('hex'), hashToken(token), accountId, now, now + sessionLifetime, (request.headers['user-agent'] || '').slice(0, 300));
+	return [
+		sessionCookie(token, maxAge, isSecureRequest(request)),
+		authCookie('sb-access-token', authSession.access_token, Math.min(authSession.expires_in || 3600, maxAge), isSecureRequest(request)),
+		authCookie('sb-refresh-token', authSession.refresh_token, maxAge, isSecureRequest(request))
+	];
+}
+
+function supabaseAuthError(error) {
+	if (!(error instanceof SupabaseAuthError)) return error;
+	if (error.code === 'email_not_confirmed') return createError(403, 'Confirm your email address before signing in.');
+	if (error.code === 'invalid_credentials' || error.status === 401) return createError(401, 'Email or password is incorrect.');
+	if (error.code === 'user_already_exists' || error.code === 'email_exists') return createError(409, 'An account already uses that email address.');
+	if (error.code === 'weak_password' || error.status === 422) return createError(400, 'Password must be between 10 and 200 characters.');
+	if (error.status === 429) return createError(429, 'Too many requests. Please try again later.');
+	return createError(503, 'Supabase Auth is temporarily unavailable. Please try again.');
 }
 
 async function consumeRateLimit(request, scope, identifier, limit) {
@@ -683,7 +783,7 @@ async function resetPasswordWithToken(token, password) {
 
 async function handleApi(request, response, url) {
 	if (url.pathname.startsWith('/api/admin/audit-events')) {
-		const administrator = await getAccountForRequest(request);
+		const administrator = await getAccountForRequest(request, response);
 		if (!administrator) throw createError(401, 'Please sign in to continue.');
 		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
 		if (request.method !== 'GET' || url.pathname !== '/api/admin/audit-events') {
@@ -750,7 +850,41 @@ async function handleApi(request, response, url) {
 		return sendJson(response, 200, { events, total, limit, offset });
 	}
 
+	if (request.method === 'POST' && url.pathname === '/api/auth/callback' && authBackend === 'supabase') {
+		const body = await readBody(request);
+		if (typeof body.access_token !== 'string' || typeof body.refresh_token !== 'string') {
+			throw createError(400, 'This authentication link is invalid or expired.');
+		}
+		let authUser;
+		let authSession;
+		try {
+			authUser = await supabaseAuth.verifyAccessToken(body.access_token);
+			authSession = await supabaseAuth.refreshSession(body.refresh_token);
+			if (authSession.user?.id !== authUser.id) throw new Error('Auth callback tokens belong to different users.');
+			authUser = authSession.user;
+		} catch {
+			throw createError(400, 'This authentication link is invalid or expired.');
+		}
+		const accountId = authUser.app_metadata?.account_id;
+		const account = accountId ? accountFromRow(await queries.findById.get(accountId)) : null;
+		if (!account || account.status !== 'active') throw createError(400, 'This authentication link is invalid or expired.');
+		if (authUser.email_confirmed_at && authUser.email) {
+			await queries.verifyEmail.run(authUser.email, new Date().toISOString(), account.id);
+			account.email = authUser.email;
+			account.emailVerifiedAt = authUser.email_confirmed_at;
+			account.pendingEmail = null;
+		}
+		if (body.type === 'signup') await recordAuditEvent(account, 'email.verified');
+		return sendJson(response, 200, {
+			account: publicAccount(account),
+			type: ['signup', 'invite', 'recovery', 'email_change'].includes(body.type) ? body.type : 'signup'
+		}, {
+			'Set-Cookie': await supabaseSessionCookies(request, account.id, authSession)
+		});
+	}
+
 	if (request.method === 'POST' && url.pathname === '/api/email/verify') {
+		if (authBackend === 'supabase') throw createError(400, 'Use the verification link sent by Supabase Auth.');
 		const body = await readBody(request);
 		const account = await verifyEmailToken(body.token);
 		return sendJson(response, 200, { verified: true, account: publicAccount(accountFromRow(await queries.findById.get(account.id))) });
@@ -760,6 +894,17 @@ async function handleApi(request, response, url) {
 		await consumeRateLimit(request, 'password-reset:ip', undefined, positiveIntegerSetting('RATE_LIMIT_PASSWORD_RESET_IP_MAX', 10));
 		const body = await readBody(request);
 		const email = normalizeEmail(body.email);
+		if (authBackend === 'supabase') {
+			if (validateEmail(email)) {
+				await consumeRateLimit(request, 'password-reset:email', email, positiveIntegerSetting('RATE_LIMIT_PASSWORD_RESET_EMAIL_MAX', 4));
+				try {
+					await supabaseAuth.requestPasswordReset(email, process.env.APP_BASE_URL);
+				} catch (error) {
+					if (error.status !== 429) throw supabaseAuthError(error);
+				}
+			}
+			return sendJson(response, 200, { message: 'If that email belongs to an account, a password setup link has been sent.' });
+		}
 		if (validateEmail(email)) {
 			await consumeRateLimit(request, 'password-reset:email', email, positiveIntegerSetting('RATE_LIMIT_PASSWORD_RESET_EMAIL_MAX', 4));
 		}
@@ -781,6 +926,26 @@ async function handleApi(request, response, url) {
 
 	if (request.method === 'POST' && url.pathname === '/api/password-reset/complete') {
 		const body = await readBody(request);
+		if (authBackend === 'supabase') {
+			if (!validatePassword(body.password)) throw createError(400, 'Password must be between 10 and 200 characters.');
+			const account = await getAccountForRequest(request, response);
+			if (!account) throw createError(401, 'This password link is invalid or expired.');
+			try {
+				await supabaseAuth.setPassword(getCookie(request, 'sb-access-token'), body.password);
+			} catch (error) {
+				throw supabaseAuthError(error);
+			}
+			await queries.deleteAccountSessions.run(account.id);
+			await recordAuditEvent(account, 'password.reset');
+			const authSession = {
+				access_token: getCookie(request, 'sb-access-token'),
+				refresh_token: getCookie(request, 'sb-refresh-token'),
+				expires_in: 3600
+			};
+			return sendJson(response, 200, { message: 'Your password has been updated.' }, {
+				'Set-Cookie': await supabaseSessionCookies(request, account.id, authSession)
+			});
+		}
 		await resetPasswordWithToken(body.token, body.password);
 		return sendJson(response, 200, { message: 'Your password has been reset. Sign in with your new password.' });
 	}
@@ -791,6 +956,22 @@ async function handleApi(request, response, url) {
 		const displayName = typeof body.displayName === 'string' ? body.displayName.trim() : '';
 		if (!displayName || displayName.length > 80) throw createError(400, 'Enter a name of 1 to 80 characters.');
 		if (!validatePassword(body.password)) throw createError(400, 'Password must be between 10 and 200 characters.');
+		if (authBackend === 'supabase') {
+			const account = await getAccountForRequest(request, response);
+			if (!account) throw createError(401, 'Please open the invitation link before setting your password.');
+			const invitation = await queries.findActiveInvitationByEmail.get('invite', account.email, Date.now());
+			if (!invitation || invitation.account_id !== account.id) throw createError(410, 'This invitation has expired or was already used.');
+			try {
+				await supabaseAuth.setPassword(getCookie(request, 'sb-access-token'), body.password);
+			} catch (error) {
+				throw supabaseAuthError(error);
+			}
+			await queries.update.run(displayName, account.id);
+			await queries.markInvitationUsed.run(Date.now(), account.id, account.email);
+			await recordAuditEvent(account, 'invitation.accepted');
+			account.displayName = displayName;
+			return sendJson(response, 201, { account: publicAccount(account) });
+		}
 
 		const account = await withTransaction(async () => {
 			const record = await readRedeemableToken(token, 'invite');
@@ -814,14 +995,14 @@ async function handleApi(request, response, url) {
 	}
 
 	if (request.method === 'GET' && url.pathname === '/api/admin/status') {
-		const administrator = await getAccountForRequest(request);
+		const administrator = await getAccountForRequest(request, response);
 		if (!administrator) throw createError(401, 'Please sign in to continue.');
 		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
 		return sendJson(response, 200, await getOperationalStatus());
 	}
 
 	if (url.pathname === '/api/admin/invitations') {
-		const administrator = await getAccountForRequest(request);
+		const administrator = await getAccountForRequest(request, response);
 		if (!administrator) throw createError(401, 'Please sign in to continue.');
 		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
 
@@ -834,6 +1015,34 @@ async function handleApi(request, response, url) {
 			if (existingAccount || activeInvitation) {
 				return sendJson(response, 200, { message: 'If that address is available, an invitation has been sent.' });
 			}
+			if (authBackend === 'supabase') {
+				let authUser;
+				let account;
+				try {
+					const inviteResult = await supabaseAuth.inviteUser(email, 'Invited user', process.env.APP_BASE_URL);
+					authUser = inviteResult.user || (inviteResult.id ? inviteResult : null);
+					if (!authUser?.id) throw new Error('Supabase Auth did not return the invited user.');
+					account = {
+						id: randomBytes(16).toString('hex'),
+						email,
+						displayName: 'Invited user',
+						createdAt: new Date().toISOString(),
+						role: 'user',
+						status: 'active',
+						emailVerifiedAt: null,
+						pendingEmail: null
+					};
+					await queries.insert.run(account.id, email, account.displayName, account.createdAt, account.role, account.status, '', '');
+					await supabaseAuth.setAccountId(authUser.id, account.id);
+					await createAccountToken(account.id, 'invite', email, inviteLifetime);
+				} catch (error) {
+					if (authUser?.id) await supabaseAuth.deleteUser(authUser.id).catch(() => {});
+					if (account?.id) await queries.delete.run(account.id).catch(() => {});
+					throw supabaseAuthError(error);
+				}
+				await recordAuditEvent(administrator, 'invitation.created', account, { email });
+				return sendJson(response, 200, { message: 'An invitation has been sent.' });
+			}
 			const token = await createAccountToken(administrator.id, 'invite', email, inviteLifetime);
 			await sendAccountEmail('invite', email, token);
 			await recordAuditEvent(administrator, 'invitation.created', administrator, { email });
@@ -844,6 +1053,22 @@ async function handleApi(request, response, url) {
 			const body = await readBody(request);
 			const email = normalizeEmail(body.email);
 			if (!validateEmail(email)) throw createError(400, 'Enter a valid email address.');
+			if (authBackend === 'supabase') {
+				const invitation = await queries.findActiveInvitationByEmail.get('invite', email, Date.now());
+				if (invitation) {
+					const target = accountFromRow(await queries.findById.get(invitation.account_id));
+					const authUser = await supabaseAuth.findUserByEmail(email);
+					if (authUser?.app_metadata?.account_id === invitation.account_id) {
+						await supabaseAuth.deleteUser(authUser.id);
+						if (target) {
+							await recordAuditEvent(administrator, 'invitation.cancelled', target, { email });
+							await queries.delete.run(target.id);
+						}
+					}
+					await queries.deleteInvitationByEmail.run(Date.now(), email);
+				}
+				return sendJson(response, 200, { message: 'Invitation cancelled.' });
+			}
 			const deleted = await queries.deleteInvitationByEmail.run(Date.now(), email);
 			if (deleted.rowCount && deleted.rowCount > 0) {
 				await recordAuditEvent(administrator, 'invitation.cancelled', administrator, { email });
@@ -855,7 +1080,7 @@ async function handleApi(request, response, url) {
 	}
 
 	if (url.pathname.startsWith('/api/admin/accounts')) {
-		const administrator = await getAccountForRequest(request);
+		const administrator = await getAccountForRequest(request, response);
 		if (!administrator) throw createError(401, 'Please sign in to continue.');
 		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
 
@@ -976,6 +1201,50 @@ async function handleApi(request, response, url) {
 			throw createError(409, 'An account already uses that email address.');
 		}
 
+		if (authBackend === 'supabase') {
+			let authResult;
+			try {
+				authResult = await supabaseAuth.signUp(email, body.password, displayName, process.env.APP_BASE_URL);
+			} catch (error) {
+				throw supabaseAuthError(error);
+			}
+			const authUser = authResult.user || (authResult.id ? authResult : null);
+			const authSession = authResult.session || (authResult.access_token ? authResult : null);
+			if (!authUser?.id) {
+				return sendJson(response, 200, { message: 'If that address is available, check your email for next steps.' });
+			}
+			const account = {
+				id: randomBytes(16).toString('hex'),
+				email,
+				displayName,
+				createdAt: new Date().toISOString(),
+				role: 'user',
+				status: 'active',
+				emailVerifiedAt: authUser.email_confirmed_at || null,
+				pendingEmail: null
+			};
+			try {
+				await queries.insert.run(account.id, account.email, account.displayName, account.createdAt, account.role, account.status, '', '');
+				await supabaseAuth.setAccountId(authUser.id, account.id);
+				if (authSession) authResult = await supabaseAuth.signInWithPassword(email, body.password);
+			} catch (error) {
+				await supabaseAuth.deleteUser(authUser.id).catch(() => {});
+				await queries.delete.run(account.id).catch(() => {});
+				if (isUniqueConstraintError(error)) throw createError(409, 'An account already uses that email address.');
+				throw supabaseAuthError(error);
+			}
+			if (authResult.session || authResult.access_token) {
+				return sendJson(response, 201, { account: publicAccount(account) }, {
+					'Set-Cookie': await supabaseSessionCookies(request, account.id, authResult.session || authResult)
+				});
+			}
+			return sendJson(response, 201, {
+				account: publicAccount(account),
+				needsEmailVerification: true,
+				message: 'Check your email for a confirmation link before signing in.'
+			});
+		}
+
 		const credentials = await hashPassword(body.password);
 		const account = {
 			id: randomBytes(16).toString('hex'),
@@ -1008,6 +1277,28 @@ async function handleApi(request, response, url) {
 		if (validateEmail(email)) {
 			await consumeRateLimit(request, 'sign-in:email', email, positiveIntegerSetting('RATE_LIMIT_SIGN_IN_EMAIL_MAX', 8));
 		}
+		if (authBackend === 'supabase') {
+			let authResult;
+			try {
+				authResult = await supabaseAuth.signInWithPassword(email, typeof body.password === 'string' ? body.password : '');
+			} catch (error) {
+				throw supabaseAuthError(error);
+			}
+			const accountId = authResult.user?.app_metadata?.account_id;
+			const account = accountId ? accountFromRow(await queries.findById.get(accountId)) : null;
+			if (!account || account.status !== 'active') throw createError(401, 'Email or password is incorrect.');
+			if (account.role === 'admin') {
+				const mfaSecret = await queries.findMfaSecret.get(account.id);
+				if (mfaSecret && mfaSecret.enabled) {
+					if (typeof body.code !== 'string') throw createError(401, 'Multi-factor authentication code is required.');
+					if (!verifyTotpCode(mfaSecret.secret, body.code)) throw createError(401, 'Invalid or expired multi-factor authentication code.');
+				}
+			}
+			await recordAuditEvent(account, 'sign_in.succeeded');
+			return sendJson(response, 200, { account: publicAccount(account) }, {
+				'Set-Cookie': await supabaseSessionCookies(request, account.id, authResult)
+			});
+		}
 		const account = accountFromRow(await queries.findByEmail.get(email));
 		const password = typeof body.password === 'string' ? body.password : '';
 		const validPassword = await passwordMatches(password, account || dummyPasswordCredentials);
@@ -1031,10 +1322,22 @@ async function handleApi(request, response, url) {
 	if (request.method === 'POST' && url.pathname === '/api/logout') {
 		const token = getSessionToken(request);
 		if (token) await queries.deleteSessionByToken.run(hashToken(token));
+		if (authBackend === 'supabase') {
+			const accessToken = getCookie(request, 'sb-access-token');
+			if (accessToken) await supabaseAuth.logout(accessToken).catch(() => {});
+			const secure = isSecureRequest(request);
+			return sendJson(response, 200, { ok: true }, {
+				'Set-Cookie': [
+					clearSessionCookie(request),
+					authCookie('sb-access-token', '', 0, secure),
+					authCookie('sb-refresh-token', '', 0, secure)
+				]
+			});
+		}
 		return sendJson(response, 200, { ok: true }, { 'Set-Cookie': clearSessionCookie(request) });
 	}
 
-	const account = await getAccountForRequest(request);
+	const account = await getAccountForRequest(request, response);
 	if (!account) throw createError(401, 'Please sign in to continue.');
 
 	if (request.method === 'GET' && url.pathname === '/api/me') {
@@ -1060,9 +1363,17 @@ async function handleApi(request, response, url) {
 		if (!session) throw createError(404, 'Active session not found.');
 		const current = session.token_hash === hashToken(getSessionToken(request) || '');
 		await queries.deleteSessionById.run(session.session_id, account.id);
-		return sendJson(response, 200, { revoked: true, current }, current
-			? { 'Set-Cookie': clearSessionCookie(request) }
-			: {});
+		if (current && authBackend === 'supabase') {
+			const secure = isSecureRequest(request);
+			return sendJson(response, 200, { revoked: true, current }, {
+				'Set-Cookie': [
+					clearSessionCookie(request),
+					authCookie('sb-access-token', '', 0, secure),
+					authCookie('sb-refresh-token', '', 0, secure)
+				]
+			});
+		}
+		return sendJson(response, 200, { revoked: true, current }, current ? { 'Set-Cookie': clearSessionCookie(request) } : {});
 	}
 
 	if (request.method === 'PATCH' && url.pathname === '/api/me') {
@@ -1076,6 +1387,13 @@ async function handleApi(request, response, url) {
 		if (changingEmail) {
 			if (await queries.findEmailOwner.get(email, email, account.id)) {
 				throw createError(409, 'An account already uses that email address.');
+			}
+			if (authBackend === 'supabase') {
+				try {
+					await supabaseAuth.updateEmail(getCookie(request, 'sb-access-token'), email);
+				} catch (error) {
+					throw supabaseAuthError(error);
+				}
 			}
 		}
 		const changedFields = [];
@@ -1107,6 +1425,14 @@ async function handleApi(request, response, url) {
 			throw createError(409, 'Your current email address is already verified.');
 		}
 		const email = account.pendingEmail || account.email;
+		if (authBackend === 'supabase') {
+			try {
+				await supabaseAuth.resendConfirmation(email, process.env.APP_BASE_URL, account.pendingEmail ? 'email_change' : 'signup');
+			} catch (error) {
+				throw supabaseAuthError(error);
+			}
+			return sendJson(response, 200, { message: `A verification link has been sent to ${email}.` });
+		}
 		const token = await createAccountToken(account.id, 'verify_email', email, verificationLifetime);
 		await sendAccountEmail('verify_email', email, token);
 		return sendJson(response, 200, { message: `A verification link has been sent to ${email}.` });
@@ -1114,6 +1440,29 @@ async function handleApi(request, response, url) {
 
 	if (request.method === 'POST' && url.pathname === '/api/me/password') {
 		const body = await readBody(request);
+		if (authBackend === 'supabase') {
+			if (typeof body.currentPassword !== 'string' || !validatePassword(body.newPassword)) {
+				throw createError(400, 'Enter your current password and a new password of 10 to 200 characters.');
+			}
+			if (body.currentPassword === body.newPassword) throw createError(400, 'Choose a new password different from your current password.');
+			try {
+				const confirmation = await supabaseAuth.signInWithPassword(account.email, body.currentPassword);
+				if (confirmation.user?.app_metadata?.account_id !== account.id) throw createError(401, 'Your current password is incorrect.');
+				await supabaseAuth.setPassword(getCookie(request, 'sb-access-token'), body.newPassword);
+			} catch (error) {
+				if (error.status === 401) throw createError(401, 'Your current password is incorrect.');
+				throw supabaseAuthError(error);
+			}
+			await queries.deleteAccountSessions.run(account.id);
+			await recordAuditEvent(account, 'password.changed');
+			return sendJson(response, 200, { message: 'Password changed successfully.' }, {
+				'Set-Cookie': await supabaseSessionCookies(request, account.id, {
+					access_token: getCookie(request, 'sb-access-token'),
+					refresh_token: getCookie(request, 'sb-refresh-token'),
+					expires_in: 3600
+				})
+			});
+		}
 		if (typeof body.currentPassword !== 'string' || !(await passwordMatches(body.currentPassword, account))) {
 			throw createError(401, 'Your current password is incorrect.');
 		}
@@ -1175,6 +1524,28 @@ async function handleApi(request, response, url) {
 
 	if (request.method === 'DELETE' && url.pathname === '/api/me') {
 		const body = await readBody(request);
+		if (authBackend === 'supabase') {
+			try {
+				const confirmation = await supabaseAuth.signInWithPassword(account.email, typeof body.password === 'string' ? body.password : '');
+				if (confirmation.user?.app_metadata?.account_id !== account.id) throw createError(401, 'Enter your current password to delete this account.');
+				await supabaseAuth.deleteUser(account.authUserId);
+			} catch (error) {
+				if (error.status === 401) throw createError(401, 'Enter your current password to delete this account.');
+				throw supabaseAuthError(error);
+			}
+			await withTransaction(async () => {
+				await recordAuditEvent(account, 'account.deleted', account, { source: 'self_service' });
+				await queries.delete.run(account.id);
+			});
+			const secure = isSecureRequest(request);
+			return sendJson(response, 200, { ok: true }, {
+				'Set-Cookie': [
+					clearSessionCookie(request),
+					authCookie('sb-access-token', '', 0, secure),
+					authCookie('sb-refresh-token', '', 0, secure)
+				]
+			});
+		}
 		if (typeof body.password !== 'string' || !(await passwordMatches(body.password, account))) {
 			throw createError(401, 'Enter your current password to delete this account.');
 		}
@@ -1340,8 +1711,49 @@ async function promoteFirstAdmin(email) {
 	console.log(`Promoted ${account.email} to the first administrator.`);
 }
 
+async function migrateAccountsToSupabaseAuth(applyChanges) {
+	if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+		throw new Error('Set SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY before migrating accounts.');
+	}
+	if (!process.env.APP_BASE_URL) throw new Error('Set APP_BASE_URL before migrating accounts so Auth emails redirect to the application.');
+	const accounts = await queries.listAllAccounts.all();
+	if (!applyChanges) {
+		const pendingCount = accounts.filter(row => row.password_hash).length;
+		console.log(`Dry run: ${pendingCount} account(s) still need Supabase Auth migration and a password setup email.`);
+		console.log('Re-run with --apply to perform the migration.');
+		return;
+	}
+
+	let migrated = 0;
+	for (const row of accounts) {
+		const account = accountFromRow(row);
+		let authUser = await supabaseAuth.findUserByEmail(account.email);
+		if (authUser?.app_metadata?.account_id && authUser.app_metadata.account_id !== account.id) {
+			throw new Error(`Supabase Auth already maps ${account.email} to a different app account.`);
+		}
+		if (authUser?.app_metadata?.account_id === account.id && !account.passwordHash) continue;
+		if (!authUser) {
+			const inviteResult = await supabaseAuth.inviteUser(account.email, account.displayName, process.env.APP_BASE_URL);
+			authUser = inviteResult.user || (inviteResult.id ? inviteResult : null);
+			if (!authUser?.id) throw new Error('Supabase Auth did not return an invited user.');
+			await supabaseAuth.setAccountId(authUser.id, account.id);
+			await createAccountToken(account.id, 'invite', account.email, inviteLifetime);
+		} else {
+			await supabaseAuth.setAccountId(authUser.id, account.id);
+			if (account.passwordHash) await supabaseAuth.requestPasswordReset(account.email, process.env.APP_BASE_URL);
+		}
+		await queries.clearLegacyCredentials.run(account.id);
+		await queries.deleteAccountSessions.run(account.id);
+		await queries.deleteLegacyAuthTokens.run(account.id);
+		await recordAuditEvent(null, 'auth.migrated', account, { provider: 'supabase' });
+		migrated += 1;
+	}
+	console.log(`Migrated ${migrated} account(s) to Supabase Auth.`);
+}
+
 function validateProductionConfig() {
 	if (process.env.NODE_ENV !== 'production') return;
+	if (!['legacy', 'supabase'].includes(authBackend)) throw new Error('AUTH_BACKEND must be legacy or supabase.');
 	let publicUrl;
 	try {
 		publicUrl = new URL(process.env.APP_BASE_URL || '');
@@ -1360,11 +1772,21 @@ function validateProductionConfig() {
 	if (!usePostgresBackend()) {
 		throw new Error('Production requires DB_BACKEND=postgres.');
 	}
+	if (authBackend !== 'supabase') {
+		throw new Error('Production requires AUTH_BACKEND=supabase.');
+	}
+	if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+		throw new Error('Production requires SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY.');
+	}
+	let supabaseUrl;
+	try {
+		supabaseUrl = new URL(process.env.SUPABASE_URL);
+	} catch {
+		throw new Error('Production requires SUPABASE_URL to be a valid HTTPS URL.');
+	}
+	if (supabaseUrl.protocol !== 'https:') throw new Error('Production requires SUPABASE_URL to use HTTPS.');
 	if (process.env.TRUST_PROXY !== 'true') {
 		throw new Error('Production requires TRUST_PROXY=true behind the HTTPS reverse proxy.');
-	}
-	if (!process.env.SMTP_HOST || !process.env.MAIL_FROM) {
-		throw new Error('Production requires SMTP_HOST and MAIL_FROM for account email.');
 	}
 }
 
@@ -1376,7 +1798,7 @@ async function start() {
 		const url = new URL(request.url, 'http://localhost');
 
 		if (request.method === 'GET' && (url.pathname === '/admin' || url.pathname === '/admin/audit' || url.pathname === '/sessions')) {
-			const account = await getAccountForRequest(request);
+			const account = await getAccountForRequest(request, response);
 			if (!account) return sendJson(response, 401, { error: 'Please sign in to continue.' });
 			if ((url.pathname === '/admin' || url.pathname === '/admin/audit') && account.role !== 'admin') {
 				return sendJson(response, 403, { error: 'Administrator access is required.' });
@@ -1427,6 +1849,10 @@ async function main() {
 		}
 		await initializeDatabase();
 		return promoteFirstAdmin(process.argv[3]);
+	}
+	if (process.argv[2] === 'migrate-auth') {
+		await initializeDatabase();
+		return migrateAccountsToSupabaseAuth(process.argv.includes('--apply'));
 	}
 	return start();
 }

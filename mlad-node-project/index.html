@@ -238,6 +238,17 @@
           <button class="secondary" id="verification-back" type="button">Continue to account</button>
         </div>
 
+        <div id="invitation-view" hidden>
+          <h2>Finish creating your account</h2>
+          <p class="subheading">Choose your name and password to continue.</p>
+          <form id="invitation-form">
+            <div class="field"><label for="invitation-name">Name</label><input id="invitation-name" name="displayName" autocomplete="name" maxlength="80" required></div>
+            <div class="field"><label for="invitation-password">Password</label><input id="invitation-password" name="password" type="password" autocomplete="new-password" minlength="10" maxlength="200" required></div>
+            <div class="form-actions"><button class="primary" type="submit">Create account</button></div>
+            <p class="message" id="invitation-message" role="status"></p>
+          </form>
+        </div>
+
         <div id="account-view" hidden>
           <div class="account-heading">
             <div><h2>Your account</h2><p class="account-summary">Review and update your account details.</p></div>
@@ -433,6 +444,7 @@
     const resetRequestView = document.querySelector('#reset-request-view');
     const resetCompleteView = document.querySelector('#reset-complete-view');
     const verificationView = document.querySelector('#verification-view');
+    const invitationView = document.querySelector('#invitation-view');
     const authForm = document.querySelector('#auth-form');
     const appLayout = document.querySelector('.layout');
     const intro = document.querySelector('.intro');
@@ -442,6 +454,10 @@
     const actionParams = new URLSearchParams(window.location.search);
     const verificationToken = actionParams.get('verify');
     const resetToken = actionParams.get('reset');
+    const authHashParams = new URLSearchParams(window.location.hash.slice(1));
+    const authAccessToken = authHashParams.get('access_token');
+    const authRefreshToken = authHashParams.get('refresh_token');
+    const authCallbackType = authHashParams.get('type');
     const adminPageSize = 10;
     let adminOffset = 0;
     let adminTotal = 0;
@@ -476,6 +492,7 @@
       resetRequestView.hidden = true;
       resetCompleteView.hidden = true;
       verificationView.hidden = true;
+      invitationView.hidden = true;
       document.querySelector('#auth-message').textContent = message;
       document.querySelector('#password').value = '';
     }
@@ -490,6 +507,7 @@
       resetRequestView.hidden = true;
       resetCompleteView.hidden = true;
       verificationView.hidden = true;
+      invitationView.hidden = true;
       document.querySelector('#admin-nav').hidden = account.role !== 'admin';
       document.querySelector('#profile-name').value = account.displayName;
       document.querySelector('#profile-email').value = account.pendingEmail || account.email;
@@ -894,6 +912,20 @@
     document.querySelector('#reset-complete-back').addEventListener('click', () => window.location.assign('/'));
     document.querySelector('#verification-back').addEventListener('click', () => window.location.assign('/'));
 
+    document.querySelector('#invitation-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const message = document.querySelector('#invitation-message');
+      message.textContent = '';
+      message.classList.remove('success');
+      try {
+        const values = Object.fromEntries(new FormData(event.currentTarget));
+        const result = await request('/api/invitation/accept', { method: 'POST', body: JSON.stringify(values) });
+        showAccount(result.account);
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    });
+
     document.querySelector('#resend-verification').addEventListener('click', async () => {
       const message = document.querySelector('#verification-request-message');
       message.textContent = '';
@@ -946,6 +978,11 @@
       try {
         const result = await request(`/api/${mode}`, { method: 'POST', body: JSON.stringify(values) });
         authForm.reset();
+        if (result.needsEmailVerification) {
+          message.textContent = result.message;
+          message.classList.add('success');
+          return;
+        }
         showAccount(result.account);
       } catch (error) {
         message.textContent = error.message;
@@ -992,7 +1029,47 @@
       }
     });
 
-    if (verificationToken) {
+    if (authAccessToken && authRefreshToken && ['signup', 'invite', 'recovery', 'email_change'].includes(authCallbackType)) {
+      setMainMode('auth', authCallbackType === 'recovery' ? 'Password recovery' : 'Email confirmation');
+      authView.hidden = true;
+      accountView.hidden = true;
+      adminView.hidden = true;
+      auditView.hidden = true;
+      sessionsView.hidden = true;
+      resetRequestView.hidden = true;
+      resetCompleteView.hidden = authCallbackType !== 'recovery';
+      verificationView.hidden = authCallbackType === 'recovery' || authCallbackType === 'invite';
+      invitationView.hidden = authCallbackType !== 'invite';
+      window.history.replaceState(null, '', '/');
+      request('/api/auth/callback', {
+        method: 'POST',
+        body: JSON.stringify({
+          access_token: authAccessToken,
+          refresh_token: authRefreshToken,
+          type: authCallbackType,
+          expires_in: authHashParams.get('expires_in')
+        })
+      }).then(result => {
+        if (authCallbackType === 'invite') {
+          document.querySelector('#invitation-name').value = result.account.displayName === 'Invited user' ? '' : result.account.displayName;
+          return;
+        }
+        if (authCallbackType === 'recovery') return;
+        document.querySelector('#verification-message').textContent = 'Your email address is verified.';
+      }).catch(error => {
+        if (authCallbackType === 'recovery') {
+          resetCompleteView.hidden = true;
+          authView.hidden = false;
+          document.querySelector('#auth-message').textContent = error.message;
+        } else if (authCallbackType === 'invite') {
+          invitationView.hidden = true;
+          authView.hidden = false;
+          document.querySelector('#auth-message').textContent = error.message;
+        } else {
+          document.querySelector('#verification-message').textContent = error.message;
+        }
+      });
+    } else if (verificationToken) {
       setMainMode('auth', 'Email verification');
       authView.hidden = true;
       accountView.hidden = true;

@@ -9,10 +9,11 @@
   "scripts": {
     "start": "node server.js",
     "promote-admin": "node server.js promote-admin",
+    "auth:migrate": "node server.js migrate-auth",
     "db:backup": "node db-tools.js backup",
     "db:restore": "node db-tools.js restore",
     "db:migrate-supabase": "node db-tools.js migrate-supabase",
-    "test": "node --test account-roles.test.js"
+    "test": "node --test account-roles.test.js supabase-auth.test.js supabase-auth.integration.test.js"
   },
   "dependencies": {
     "dotenv": "^18.0.9",

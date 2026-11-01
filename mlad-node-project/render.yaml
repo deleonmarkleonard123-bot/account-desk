@@ -16,21 +16,17 @@ services:
         sync: false
       - key: DB_BACKEND
         value: postgres
+      - key: AUTH_BACKEND
+        value: supabase
       - key: DATABASE_URL
         sync: false
       - key: DATABASE_SSL_CA
         value: /etc/secrets/supabase-ca.crt
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
       - key: TRUST_PROXY
         value: "true"
-      - key: SMTP_HOST
-        sync: false
-      - key: SMTP_PORT
-        value: "587"
-      - key: SMTP_SECURE
-        value: "false"
-      - key: SMTP_USER
-        sync: false
-      - key: SMTP_PASS
-        sync: false
-      - key: MAIL_FROM
-        sync: false

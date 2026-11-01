@@ -348,6 +348,100 @@ test('only the first promoted administrator can access admin routes', async () =
 	database.close();
 });
 
+test('audit events support filters and CSV export for admins', async () => {
+	const auditDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'account-audit-'));
+	const auditDatabaseFile = path.join(auditDirectory, 'audit.sqlite');
+	const auditPort = await getFreePort();
+	const auditUrl = `http://127.0.0.1:${auditPort}`;
+	const auditServer = spawn(process.execPath, [serverFile], {
+		stdio: 'ignore',
+		env: {
+			...process.env,
+			HOST: '127.0.0.1',
+			PORT: String(auditPort),
+			APP_BASE_URL: 'https://accounts.example.test',
+			DB_PATH: auditDatabaseFile,
+			DB_BACKEND: 'sqlite',
+			NODE_ENV: 'test',
+			SMTP_HOST: '127.0.0.1',
+			SMTP_PORT: String(smtpPort),
+			MAIL_FROM: 'Account Desk <no-reply@example.test>',
+			TRUST_PROXY: 'true'
+		}
+	});
+
+	try {
+		for (let attempt = 0; attempt < 50; attempt += 1) {
+			if (auditServer.exitCode !== null) throw new Error('Audit test server exited before becoming ready.');
+			try {
+				const response = await fetch(`${auditUrl}/api/me`);
+				if (response.status === 401) break;
+			} catch {}
+			await new Promise(resolve => setTimeout(resolve, 50));
+		}
+
+		let response = await fetch(`${auditUrl}/api/register`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				displayName: 'Audit User',
+				email: 'audit-user@example.com',
+				password: 'audit-user-password'
+			})
+		});
+		assert.equal(response.status, 201);
+		const created = await response.json();
+		const sessionCookie = response.headers.get('set-cookie').split(';')[0];
+
+		response = await fetch(`${auditUrl}/api/admin/audit-events?limit=20&offset=0&action=sign_in.succeeded&actorEmail=audit-user@example.com&affectedEmail=audit-user@example.com`, {
+			headers: { Cookie: sessionCookie }
+		});
+		assert.equal(response.status, 403);
+
+		const promotion = spawnSync(process.execPath, [serverFile, 'promote-admin', 'audit-user@example.com'], {
+			encoding: 'utf8',
+			env: { ...process.env, DB_BACKEND: 'sqlite', DB_PATH: auditDatabaseFile }
+		});
+		assert.equal(promotion.status, 0, promotion.stderr || promotion.stdout);
+		const adminHeaders = { Cookie: sessionCookie, 'Content-Type': 'application/json' };
+		response = await fetch(`${auditUrl}/api/login`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ email: 'audit-user@example.com', password: 'audit-user-password' })
+		});
+		assert.equal(response.status, 200);
+		const loginCookie = response.headers.get('set-cookie').split(';')[0];
+		const loggedInHeaders = { Cookie: loginCookie, 'Content-Type': 'application/json' };
+
+		response = await fetch(`${auditUrl}/api/admin/audit-events?limit=20&offset=0&action=sign_in.succeeded&actorEmail=audit-user@example.com&affectedEmail=audit-user@example.com`, { headers: loggedInHeaders });
+		assert.equal(response.status, 200);
+		const filtered = await response.json();
+		assert.ok(filtered.total >= 1);
+		assert.ok(filtered.events.some(event => event.action === 'sign_in.succeeded' && event.actorEmail === 'audit-user@example.com'));
+
+		response = await fetch(`${auditUrl}/api/admin/audit-events?format=csv&action=sign_in.succeeded&actorEmail=audit-user@example.com`, { headers: adminHeaders });
+		assert.equal(response.status, 200);
+		assert.match(response.headers.get('content-type'), /text\/csv/);
+		const csvText = await response.text();
+		assert.match(csvText, /event_id|actor_email|action|affected_email/i);
+		assert.match(csvText, /sign_in\.succeeded/);
+		assert.ok(!csvText.toLowerCase().includes('audit-user-password'));
+		assert.ok(!csvText.includes('session='));
+
+		response = await fetch(`${auditUrl}/api/admin/audit-events?from=2999-01-01T00:00:00.000Z&to=3000-01-01T00:00:00.000Z`, { headers: adminHeaders });
+		assert.equal(response.status, 200);
+		const dateFiltered = await response.json();
+		assert.equal(dateFiltered.total, 0);
+		assert.equal(dateFiltered.events.length, 0);
+	} finally {
+		if (auditServer.exitCode === null) {
+			auditServer.kill('SIGTERM');
+			await once(auditServer, 'exit');
+		}
+		await fs.rm(auditDirectory, { recursive: true, force: true });
+	}
+});
+
 test('email verification and password management enforce one-time token rules', async () => {
 	let response = await fetch(`${baseUrl}/api/register`, {
 		method: 'POST',

@@ -328,7 +328,28 @@
               <label for="audit-search">Search events</label>
               <input id="audit-search" type="search" maxlength="100" placeholder="Action, email, or account ID">
             </div>
+            <div class="field">
+              <label for="audit-action-filter">Action</label>
+              <input id="audit-action-filter" type="text" maxlength="80" placeholder="e.g. sign_in.succeeded">
+            </div>
+            <div class="field">
+              <label for="audit-actor-filter">Actor email</label>
+              <input id="audit-actor-filter" type="email" maxlength="254" placeholder="actor@example.com">
+            </div>
+            <div class="field">
+              <label for="audit-affected-filter">Affected email</label>
+              <input id="audit-affected-filter" type="email" maxlength="254" placeholder="target@example.com">
+            </div>
+            <div class="field">
+              <label for="audit-from-filter">From</label>
+              <input id="audit-from-filter" type="datetime-local" step="1">
+            </div>
+            <div class="field">
+              <label for="audit-to-filter">To</label>
+              <input id="audit-to-filter" type="datetime-local" step="1">
+            </div>
             <button class="primary" type="submit">Search</button>
+            <button class="secondary" id="audit-export" type="button">Export CSV</button>
           </form>
           <div class="table-scroll">
             <table class="audit-table">
@@ -649,14 +670,25 @@
       return row;
     }
 
-    async function loadAuditEvents() {
-      const message = document.querySelector('#audit-message');
-      message.textContent = '';
-      const params = new URLSearchParams({
+    function buildAuditParams() {
+      const fromValue = document.querySelector('#audit-from-filter').value;
+      const toValue = document.querySelector('#audit-to-filter').value;
+      return new URLSearchParams({
         q: document.querySelector('#audit-search').value.trim(),
+        action: document.querySelector('#audit-action-filter').value.trim(),
+        actorEmail: document.querySelector('#audit-actor-filter').value.trim(),
+        affectedEmail: document.querySelector('#audit-affected-filter').value.trim(),
+        from: fromValue ? new Date(fromValue).toISOString() : '',
+        to: toValue ? new Date(toValue).toISOString() : '',
         limit: '20',
         offset: String(auditOffset)
       });
+    }
+
+    async function loadAuditEvents() {
+      const message = document.querySelector('#audit-message');
+      message.textContent = '';
+      const params = buildAuditParams();
       try {
         const result = await request(`/api/admin/audit-events?${params}`);
         auditTotal = result.total;
@@ -669,6 +701,12 @@
       } catch (error) {
         message.textContent = error.message;
       }
+    }
+
+    function exportAuditEvents() {
+      const params = buildAuditParams();
+      params.set('format', 'csv');
+      window.location.assign(`/api/admin/audit-events?${params}`);
     }
 
     document.querySelector('#admin-nav').addEventListener('click', () => window.location.assign('/admin'));
@@ -699,6 +737,7 @@
       auditOffset = 0;
       loadAuditEvents();
     });
+    document.querySelector('#audit-export').addEventListener('click', exportAuditEvents);
     document.querySelector('#audit-previous').addEventListener('click', () => {
       auditOffset = Math.max(0, auditOffset - 20);
       loadAuditEvents();

@@ -493,13 +493,18 @@ async function handleApi(request, response, url) {
 		}
 
 		const search = (url.searchParams.get('q') || '').trim().slice(0, 100);
+		const action = (url.searchParams.get('action') || '').trim().slice(0, 80);
+		const actorEmail = (url.searchParams.get('actorEmail') || '').trim().slice(0, 254);
+		const affectedEmail = (url.searchParams.get('affectedEmail') || '').trim().slice(0, 254);
+		const from = (url.searchParams.get('from') || '').trim();
+		const to = (url.searchParams.get('to') || '').trim();
+		const format = url.searchParams.get('format') === 'csv' ? 'csv' : 'json';
 		const requestedLimit = Number(url.searchParams.get('limit')) || 20;
 		const requestedOffset = Number(url.searchParams.get('offset')) || 0;
 		const limit = Math.min(100, Math.max(1, Math.floor(requestedLimit)));
 		const offset = Math.min(1000000, Math.max(0, Math.floor(requestedOffset)));
 		const filters = [search, search, search, search, search, search];
-		const total = (await queries.countAuditEvents.get(...filters)).count;
-		const events = (await queries.listAuditEvents.all(...filters, limit, offset)).map(event => ({
+		const baseEvents = (await queries.listAuditEvents.all(...filters, 10000, 0)).map(event => ({
 			id: event.event_id,
 			actorAccountId: event.actor_account_id,
 			actorEmail: event.actor_email,
@@ -509,6 +514,41 @@ async function handleApi(request, response, url) {
 			occurredAt: event.occurred_at,
 			metadata: JSON.parse(event.metadata_json)
 		}));
+		const filteredEvents = baseEvents.filter(event => {
+			if (action && !event.action.toLowerCase().includes(action.toLowerCase())) return false;
+			if (actorEmail && !(event.actorEmail || '').toLowerCase().includes(actorEmail.toLowerCase())) return false;
+			if (affectedEmail && !(event.affectedEmail || '').toLowerCase().includes(affectedEmail.toLowerCase())) return false;
+			if (from && event.occurredAt < from) return false;
+			if (to && event.occurredAt > to) return false;
+			return true;
+		});
+		const total = filteredEvents.length;
+		const events = filteredEvents.slice(offset, offset + limit);
+		if (format === 'csv') {
+			const header = ['event_id', 'actor_account_id', 'actor_email', 'action', 'affected_account_id', 'affected_email', 'occurred_at', 'metadata_json'];
+			const csvRows = [header];
+			for (const event of filteredEvents) {
+				csvRows.push([
+					event.id,
+					event.actorAccountId ?? '',
+					event.actorEmail ?? '',
+					event.action,
+					event.affectedAccountId ?? '',
+					event.affectedEmail ?? '',
+					event.occurredAt,
+					JSON.stringify(event.metadata ?? {})
+				]);
+			}
+			const escapeCsv = value => `"${String(value ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`;
+			const csv = csvRows.map(row => row.map(escapeCsv).join(',')).join('\n');
+			response.writeHead(200, {
+				'Content-Type': 'text/csv; charset=utf-8',
+				'Content-Disposition': 'attachment; filename="audit-events.csv"',
+				'Cache-Control': 'no-store'
+			});
+			response.end(csv);
+			return;
+		}
 		return sendJson(response, 200, { events, total, limit, offset });
 	}
 
@@ -530,8 +570,12 @@ async function handleApi(request, response, url) {
 			const token = await createAccountToken(account.id, 'password_reset', account.email, resetLifetime);
 			try {
 				await sendAccountEmail('password_reset', account.email, token);
-			} catch {
-				console.error('Password reset email delivery failed.');
+			} catch (error) {
+				console.error('Password reset email delivery failed:', {
+					code: error.code,
+					responseCode: error.responseCode,
+					command: error.command
+				});
 			}
 		}
 		return sendJson(response, 200, { message: 'If that verified email belongs to an account, a reset link has been sent.' });

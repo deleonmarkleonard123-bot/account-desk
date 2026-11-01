@@ -129,6 +129,7 @@ function buildQueries() {
 		findSessionByToken: prepareQuery('SELECT * FROM sessions WHERE token_hash = ?'),
 		deleteSessionByToken: prepareQuery('DELETE FROM sessions WHERE token_hash = ?'),
 		listSessions: prepareQuery('SELECT * FROM sessions WHERE account_id = ? AND expires_at > ? ORDER BY created_at DESC'),
+		listAccountSessions: prepareQuery('SELECT * FROM sessions WHERE account_id = ? AND expires_at > ? ORDER BY created_at DESC LIMIT ?'),
 		findSessionById: prepareQuery('SELECT * FROM sessions WHERE session_id = ? AND account_id = ? AND expires_at > ?'),
 		deleteSessionById: prepareQuery('DELETE FROM sessions WHERE session_id = ? AND account_id = ?'),
 		deleteAccountSessions: prepareQuery('DELETE FROM sessions WHERE account_id = ?'),
@@ -154,6 +155,11 @@ function buildQueries() {
 		listAuditEvents: prepareQuery(`
 			SELECT * FROM audit_events WHERE ${auditSearch}
 			ORDER BY occurred_at DESC, event_id DESC LIMIT ? OFFSET ?
+		`),
+		listAccountAuditEvents: prepareQuery(`
+			SELECT * FROM audit_events
+			WHERE affected_account_id = ? OR actor_account_id = ?
+			ORDER BY occurred_at DESC, event_id DESC LIMIT ?
 		`),
 		findToken: prepareQuery('SELECT * FROM account_tokens WHERE token_hash = ?'),
 		insertAccountToken: prepareQuery(`
@@ -686,6 +692,45 @@ async function handleApi(request, response, url) {
 			const accountList = (await queries.listAccounts.all(...filters, limit, offset))
 				.map(row => publicAccount(accountFromRow(row)));
 			return sendJson(response, 200, { accounts: accountList, total, limit, offset });
+		}
+
+		const accountMatch = url.pathname.match(/^\/api\/admin\/accounts\/([a-f0-9]+)$/);
+		if (request.method === 'GET' && accountMatch) {
+			const target = accountFromRow(await queries.findById.get(accountMatch[1]));
+			if (!target) throw createError(404, 'Account not found.');
+
+			const [activeSessions, recentAudit] = await Promise.all([
+				queries.listAccountSessions.all(target.id, Date.now(), 5),
+				queries.listAccountAuditEvents.all(target.id, target.id, 10)
+			]);
+
+			return sendJson(response, 200, {
+				account: publicAccount(target),
+				recentSessions: activeSessions.map(session => ({
+					id: session.session_id,
+					userAgent: session.user_agent,
+					createdAt: session.created_at,
+					expiresAt: session.expires_at
+				})),
+				recentAudit: recentAudit.map(event => {
+					let metadata = {};
+					try {
+						metadata = JSON.parse(event.metadata_json || '{}');
+					} catch {
+						metadata = {};
+					}
+					return {
+						id: event.event_id,
+						actorAccountId: event.actor_account_id,
+						actorEmail: event.actor_email,
+						action: event.action,
+						affectedAccountId: event.affected_account_id,
+						affectedEmail: event.affected_email,
+						occurredAt: event.occurred_at,
+						metadata
+					};
+				})
+			});
 		}
 
 		const roleMatch = url.pathname.match(/^\/api\/admin\/accounts\/([a-f0-9]+)\/role$/);

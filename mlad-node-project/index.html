@@ -116,6 +116,16 @@
     .small-button.danger { color: var(--danger); border-color: #e8c8c3; }
     .status-badge { display: inline-block; padding: 5px 8px; border-radius: 3px; background: #e7f2eb; color: var(--green-dark); font-size: 10px; font-weight: 700; }
     .status-badge.suspended { background: #faeae7; color: var(--danger); }
+    .table-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .detail-panel { margin-top: 18px; padding: 18px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+    .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 12px 0 18px; }
+    .detail-field { padding: 10px 12px; background: #f7faf7; border: 1px solid var(--line); border-radius: 8px; }
+    .detail-field strong { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 6px; }
+    .detail-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
+    .detail-list { padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fafcfb; }
+    .detail-list h4 { margin: 0 0 10px; font-size: 14px; }
+    .detail-list ul { margin: 0; padding-left: 18px; display: grid; gap: 8px; }
+    .detail-list li { color: var(--ink); font-size: 12px; line-height: 1.5; }
     .admin-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 16px; color: var(--muted); font-size: 12px; }
     .audit-table { width: 100%; min-width: 860px; border-collapse: collapse; text-align: left; font-size: 12px; }
     .audit-table th { padding: 11px 12px; color: var(--muted); background: #f7f9f7; font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
@@ -307,6 +317,29 @@
               <thead><tr><th>Account</th><th>Created</th><th>Role</th><th>Status</th><th>Action</th></tr></thead>
               <tbody id="admin-account-rows"></tbody>
             </table>
+          </div>
+          <div class="detail-panel" id="admin-detail-panel" hidden>
+            <div class="account-heading">
+              <div><h3>Account details</h3><p class="account-summary" id="detail-summary">Select an account to inspect recent activity.</p></div>
+            </div>
+            <div class="detail-grid">
+              <div class="detail-field"><strong>Name</strong><span id="detail-name">—</span></div>
+              <div class="detail-field"><strong>Email</strong><span id="detail-email">—</span></div>
+              <div class="detail-field"><strong>Role</strong><span id="detail-role">—</span></div>
+              <div class="detail-field"><strong>Status</strong><span id="detail-status">—</span></div>
+              <div class="detail-field"><strong>Created</strong><span id="detail-created">—</span></div>
+              <div class="detail-field"><strong>Verified</strong><span id="detail-verified">—</span></div>
+            </div>
+            <div class="detail-columns">
+              <div class="detail-list">
+                <h4>Recent activity</h4>
+                <ul id="detail-audit-list"></ul>
+              </div>
+              <div class="detail-list">
+                <h4>Active sessions</h4>
+                <ul id="detail-session-list"></ul>
+              </div>
+            </div>
           </div>
           <p class="message" id="admin-message" role="status"></p>
           <div class="admin-footer">
@@ -573,6 +606,47 @@
       }
     }
 
+    async function loadAccountDetail(accountId) {
+      const message = document.querySelector('#admin-message');
+      message.textContent = '';
+      try {
+        const result = await request(`/api/admin/accounts/${accountId}`);
+        const panel = document.querySelector('#admin-detail-panel');
+        panel.hidden = false;
+        document.querySelector('#detail-summary').textContent = `${result.account.displayName} · ${result.account.email}`;
+        document.querySelector('#detail-name').textContent = result.account.displayName;
+        document.querySelector('#detail-email').textContent = result.account.email;
+        document.querySelector('#detail-role').textContent = result.account.role;
+        document.querySelector('#detail-status').textContent = result.account.status;
+        document.querySelector('#detail-created').textContent = new Date(result.account.createdAt).toLocaleString();
+        document.querySelector('#detail-verified').textContent = result.account.emailVerified ? 'Verified' : 'Pending';
+
+        const auditList = document.querySelector('#detail-audit-list');
+        if (result.recentAudit.length === 0) {
+          auditList.replaceChildren(document.createTextNode('No recent activity.'));
+        } else {
+          auditList.replaceChildren(...result.recentAudit.map(event => {
+            const item = document.createElement('li');
+            item.textContent = `${new Date(event.occurredAt).toLocaleString()} · ${event.action}`;
+            return item;
+          }));
+        }
+
+        const sessionList = document.querySelector('#detail-session-list');
+        if (result.recentSessions.length === 0) {
+          sessionList.replaceChildren(document.createTextNode('No active sessions.'));
+        } else {
+          sessionList.replaceChildren(...result.recentSessions.map(session => {
+            const item = document.createElement('li');
+            item.textContent = `${session.userAgent} · ${new Date(session.createdAt).toLocaleString()}`;
+            return item;
+          }));
+        }
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
     function makeAccountRow(account) {
       const row = document.createElement('tr');
       const identity = document.createElement('td');
@@ -618,6 +692,7 @@
       row.append(statusCell);
 
       const actionCell = document.createElement('td');
+      actionCell.className = 'table-actions';
       const statusButton = document.createElement('button');
       statusButton.className = `small-button${account.status === 'active' ? ' danger' : ''}`;
       statusButton.type = 'button';
@@ -627,7 +702,12 @@
         const verb = nextStatus === 'suspended' ? 'Suspend' : 'Reactivate';
         updateAdminAccount(account.id, 'status', nextStatus, `${verb} ${account.displayName}'s account?`);
       });
-      actionCell.append(statusButton);
+      const viewButton = document.createElement('button');
+      viewButton.className = 'small-button';
+      viewButton.type = 'button';
+      viewButton.textContent = 'View';
+      viewButton.addEventListener('click', () => loadAccountDetail(account.id));
+      actionCell.append(statusButton, viewButton);
       row.append(actionCell);
       return row;
     }

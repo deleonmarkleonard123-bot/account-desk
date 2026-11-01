@@ -570,6 +570,52 @@ test('admin multi-factor authentication enforces validation at login', async () 
 	}
 });
 
+test('admin detail endpoint exposes account context and recent activity', async () => {
+	let response = await fetch(`${baseUrl}/api/login`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			email: 'regular@example.com',
+			password: 'regular-account-password'
+		})
+	});
+	assert.equal(response.status, 200);
+	const adminCookie = response.headers.get('set-cookie').split(';')[0];
+
+	response = await fetch(`${baseUrl}/api/register`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			displayName: 'Detail Target',
+			email: 'detail-target@example.com',
+			password: 'detail-target-password'
+		})
+	});
+	assert.equal(response.status, 201);
+	const target = await response.json();
+	const targetId = target.account.id;
+
+	response = await fetch(`${baseUrl}/api/login`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', 'User-Agent': 'Detail Browser' },
+		body: JSON.stringify({ email: 'detail-target@example.com', password: 'detail-target-password' })
+	});
+	assert.equal(response.status, 200);
+	const targetCookie = response.headers.get('set-cookie').split(';')[0];
+
+	response = await fetch(`${baseUrl}/api/admin/accounts/${targetId}`, { headers: { Cookie: adminCookie } });
+	assert.equal(response.status, 200);
+	const details = await response.json();
+	assert.equal(details.account.email, 'detail-target@example.com');
+	assert.equal(details.account.displayName, 'Detail Target');
+	assert.ok(Array.isArray(details.recentAudit));
+	assert.ok(Array.isArray(details.recentSessions));
+	assert.ok(details.recentAudit.length >= 1 || details.recentSessions.length >= 1);
+
+	response = await fetch(`${baseUrl}/api/admin/accounts/${targetId}`, { headers: { Cookie: targetCookie } });
+	assert.equal(response.status, 403);
+});
+
 test('email verification and password management enforce one-time token rules', async () => {
 	let response = await fetch(`${baseUrl}/api/register`, {
 		method: 'POST',

@@ -19,6 +19,7 @@ const passwordLength = 64;
 const maxBodySize = 16 * 1024;
 const verificationLifetime = 24 * 60 * 60 * 1000;
 const resetLifetime = 15 * 60 * 1000;
+const inviteLifetime = 3 * 24 * 60 * 60 * 1000;
 const rateLimitWindowMs = positiveIntegerSetting('RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000);
 let database;
 let postgresPool;
@@ -99,6 +100,8 @@ function buildQueries() {
 	return {
 		findById: prepareQuery('SELECT * FROM accounts WHERE id = ?'),
 		findByEmail: prepareQuery('SELECT * FROM accounts WHERE lower(email) = lower(?)'),
+		findActiveInvitationByEmail: prepareQuery('SELECT * FROM account_tokens WHERE purpose = ? AND lower(email) = lower(?) AND used_at IS NULL AND expires_at > ? ORDER BY expires_at DESC LIMIT 1'),
+		deleteInvitationByEmail: prepareQuery("UPDATE account_tokens SET expires_at = ? WHERE purpose = 'invite' AND lower(email) = lower(?) AND used_at IS NULL"),
 		findMfaSecret: prepareQuery('SELECT * FROM mfa_secrets WHERE account_id = ?'),
 		insertMfaSecret: prepareQuery(`
 			INSERT INTO mfa_secrets (account_id, secret, enabled, created_at)
@@ -584,16 +587,21 @@ async function createAccountToken(accountId, purpose, email, lifetime) {
 function accountActionUrl(purpose, token) {
 	const baseUrl = process.env.APP_BASE_URL || `http://localhost:${Number(process.env.PORT) || 3000}`;
 	const url = new URL('/', baseUrl);
-	url.searchParams.set(purpose === 'verify_email' ? 'verify' : 'reset', token);
+	if (purpose === 'verify_email') url.searchParams.set('verify', token);
+	else if (purpose === 'password_reset') url.searchParams.set('reset', token);
+	else if (purpose === 'invite') url.searchParams.set('invite', token);
 	return url.toString();
 }
 
 async function sendAccountEmail(purpose, email, token) {
 	const url = accountActionUrl(purpose, token);
 	const verification = purpose === 'verify_email';
-	const subject = verification ? 'Verify your email address' : 'Reset your password';
-	const action = verification ? 'Verify your email address' : 'Choose a new password';
-	const text = `${action}: ${url}\n\nThis link expires in ${verification ? '24 hours' : '15 minutes'} and can only be used once.`;
+	const reset = purpose === 'password_reset';
+	const invite = purpose === 'invite';
+	const subject = verification ? 'Verify your email address' : reset ? 'Reset your password' : 'You are invited to Account Desk';
+	const action = verification ? 'Verify your email address' : reset ? 'Choose a new password' : 'Create your account';
+	const lifetimeText = verification ? '24 hours' : reset ? '15 minutes' : '3 days';
+	const text = `${action}: ${url}\n\nThis link expires in ${lifetimeText} and can only be used once.`;
 
 	if (process.env.SMTP_HOST) {
 		if (!process.env.MAIL_FROM) throw createError(503, 'Set MAIL_FROM to configure email delivery.');
@@ -772,11 +780,73 @@ async function handleApi(request, response, url) {
 		return sendJson(response, 200, { message: 'Your password has been reset. Sign in with your new password.' });
 	}
 
+	if (request.method === 'POST' && url.pathname === '/api/invitation/accept') {
+		const body = await readBody(request);
+		const token = typeof body.token === 'string' ? body.token : '';
+		const displayName = typeof body.displayName === 'string' ? body.displayName.trim() : '';
+		if (!displayName || displayName.length > 80) throw createError(400, 'Enter a name of 1 to 80 characters.');
+		if (!validatePassword(body.password)) throw createError(400, 'Password must be between 10 and 200 characters.');
+
+		const account = await withTransaction(async () => {
+			const record = await readRedeemableToken(token, 'invite');
+			const email = normalizeEmail(record.email);
+			if (!validateEmail(email)) throw createError(400, 'This invitation is invalid.');
+			if (await queries.findByEmail.get(email)) {
+				throw createError(409, 'An account already uses that email address.');
+			}
+			const credentials = await hashPassword(body.password);
+			const id = randomBytes(16).toString('hex');
+			await queries.insert.run(id, email, displayName, new Date().toISOString(), 'user', 'active', credentials.salt, credentials.passwordHash);
+			await queries.verifyEmail.run(email, new Date().toISOString(), id);
+			await queries.markTokenUsed.run(Date.now(), record.token_hash);
+			await recordAuditEvent({ id: record.account_id }, 'invitation.accepted', { id, email }, { invitedBy: record.account_id, invitedEmail: email });
+			return accountFromRow(await queries.findById.get(id));
+		});
+
+		return sendJson(response, 201, { account: publicAccount(account) }, {
+			'Set-Cookie': await sessionCookieForRequest(request, account.id)
+		});
+	}
+
 	if (request.method === 'GET' && url.pathname === '/api/admin/status') {
 		const administrator = await getAccountForRequest(request);
 		if (!administrator) throw createError(401, 'Please sign in to continue.');
 		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
 		return sendJson(response, 200, await getOperationalStatus());
+	}
+
+	if (url.pathname === '/api/admin/invitations') {
+		const administrator = await getAccountForRequest(request);
+		if (!administrator) throw createError(401, 'Please sign in to continue.');
+		if (administrator.role !== 'admin') throw createError(403, 'Administrator access is required.');
+
+		if (request.method === 'POST') {
+			const body = await readBody(request);
+			const email = normalizeEmail(body.email);
+			if (!validateEmail(email)) throw createError(400, 'Enter a valid email address.');
+			const existingAccount = await queries.findByEmail.get(email);
+			const activeInvitation = await queries.findActiveInvitationByEmail.get('invite', email, Date.now());
+			if (existingAccount || activeInvitation) {
+				return sendJson(response, 200, { message: 'If that address is available, an invitation has been sent.' });
+			}
+			const token = await createAccountToken(administrator.id, 'invite', email, inviteLifetime);
+			await sendAccountEmail('invite', email, token);
+			await recordAuditEvent(administrator, 'invitation.created', administrator, { email });
+			return sendJson(response, 200, { message: 'An invitation has been sent.' });
+		}
+
+		if (request.method === 'DELETE') {
+			const body = await readBody(request);
+			const email = normalizeEmail(body.email);
+			if (!validateEmail(email)) throw createError(400, 'Enter a valid email address.');
+			const deleted = await queries.deleteInvitationByEmail.run(Date.now(), email);
+			if (deleted.rowCount && deleted.rowCount > 0) {
+				await recordAuditEvent(administrator, 'invitation.cancelled', administrator, { email });
+			}
+			return sendJson(response, 200, { message: 'Invitation cancelled.' });
+		}
+
+		throw createError(404, 'That admin endpoint does not exist.');
 	}
 
 	if (url.pathname.startsWith('/api/admin/accounts')) {
@@ -1153,7 +1223,7 @@ async function initializeDatabase() {
 			CREATE TABLE IF NOT EXISTS account_tokens (
 				token_hash TEXT PRIMARY KEY,
 				account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-				purpose TEXT NOT NULL CHECK (purpose IN ('verify_email', 'password_reset')),
+				purpose TEXT NOT NULL CHECK (purpose IN ('verify_email', 'password_reset', 'invite')),
 				email TEXT,
 				expires_at INTEGER NOT NULL,
 				used_at INTEGER
@@ -1213,7 +1283,7 @@ async function initializeDatabase() {
 				CREATE TABLE IF NOT EXISTS account_tokens (
 					token_hash TEXT PRIMARY KEY,
 					account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-					purpose TEXT NOT NULL CHECK (purpose IN ('verify_email', 'password_reset')),
+					purpose TEXT NOT NULL CHECK (purpose IN ('verify_email', 'password_reset', 'invite')),
 					email TEXT,
 					expires_at INTEGER NOT NULL,
 					used_at INTEGER

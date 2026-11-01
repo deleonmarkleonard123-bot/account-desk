@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS account_tokens (
     token_hash TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    purpose TEXT NOT NULL CHECK (purpose IN ('verify_email', 'password_reset')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('verify_email', 'password_reset', 'invite')),
     email TEXT,
     expires_at BIGINT NOT NULL,
     used_at BIGINT

@@ -80,13 +80,18 @@ async function startTestSmtp() {
 }
 
 function latestEmailToken(purpose, email) {
-	const subject = purpose === 'verify_email' ? 'Verify your email address' : 'Reset your password';
+	const subject = purpose === 'verify_email'
+		? 'Verify your email address'
+		: purpose === 'password_reset'
+			? 'Reset your password'
+			: 'You are invited to Account Desk';
 	const message = [...smtpMessages].reverse().find(item => item.includes(email) && item.includes(subject));
 	assert.ok(message, `Expected ${purpose} email for ${email}`);
 	const decodedMessage = message
 		.replace(/=\n/g, '')
 		.replace(/=([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
-	const token = decodedMessage.match(new RegExp(`${purpose === 'verify_email' ? 'verify' : 'reset'}=([A-Za-z0-9_-]+)`))?.[1];
+	const tokenKey = purpose === 'verify_email' ? 'verify' : purpose === 'password_reset' ? 'reset' : 'invite';
+	const token = decodedMessage.match(new RegExp(`${tokenKey}=([A-Za-z0-9_-]+)`))?.[1];
 	assert.ok(token, `Expected a token link in the ${purpose} email`);
 	return token;
 }
@@ -645,6 +650,75 @@ test('admin operational status panel exposes health without leaking secrets', as
 		headers: { Cookie: 'session=not-a-valid-session' }
 	});
 	assert.equal(response.status, 401);
+});
+
+test('admin invitation workflow creates accounts and rejects used or cancelled links', async () => {
+	let response = await fetch(`${baseUrl}/api/login`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ email: 'regular@example.com', password: 'regular-account-password' })
+	});
+	assert.equal(response.status, 200);
+	const adminCookie = response.headers.get('set-cookie').split(';')[0];
+
+	response = await fetch(`${baseUrl}/api/admin/invitations`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+		body: JSON.stringify({ email: 'invited@example.com' })
+	});
+	assert.equal(response.status, 200);
+	let token = latestEmailToken('invite', 'invited@example.com');
+
+	response = await fetch(`${baseUrl}/api/invitation/accept`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			token,
+			displayName: 'Invited User',
+			password: 'invited-account-password'
+		})
+	});
+	const invitedResponseText = await response.text();
+	assert.equal(response.status, 201, invitedResponseText);
+	const invited = JSON.parse(invitedResponseText);
+	assert.equal(invited.account.email, 'invited@example.com');
+	assert.equal(invited.account.displayName, 'Invited User');
+	assert.equal(invited.account.emailVerified, true);
+
+	response = await fetch(`${baseUrl}/api/invitation/accept`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			token,
+			displayName: 'Again',
+			password: 'different-password'
+		})
+	});
+	assert.equal(response.status, 409);
+
+	response = await fetch(`${baseUrl}/api/admin/invitations`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+		body: JSON.stringify({ email: 'cancelled@example.com' })
+	});
+	assert.equal(response.status, 200);
+	const cancelledToken = latestEmailToken('invite', 'cancelled@example.com');
+	response = await fetch(`${baseUrl}/api/admin/invitations`, {
+		method: 'DELETE',
+		headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+		body: JSON.stringify({ email: 'cancelled@example.com' })
+	});
+	assert.equal(response.status, 200);
+	response = await fetch(`${baseUrl}/api/invitation/accept`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			token: cancelledToken,
+			displayName: 'Cancelled User',
+			password: 'cancelled-password'
+		})
+	});
+	assert.equal(response.status, 410);
 });
 
 test('email verification and password management enforce one-time token rules', async () => {
